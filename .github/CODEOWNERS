@@ -1,0 +1,16 @@
+# Default repository owners (replace @OWNER with your GitHub username or team)
+* @OWNER
+
+# Area ownership per workspace crate
+/crates/vynl-core/ @OWNER
+/crates/vynl-spotify/ @OWNER
+/crates/vynl-player/ @OWNER
+/crates/vynl-images/ @OWNER
+/crates/vynl-system/ @OWNER
+/crates/vynl-tui/ @OWNER
+
+# Supply chain, CI/CD & governance
+/.github/ @OWNER
+/deny.toml @OWNER
+/Cargo.toml @OWNER
+/SECURITY.md @OWNER

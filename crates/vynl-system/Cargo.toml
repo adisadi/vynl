@@ -1,0 +1,14 @@
+[package]
+name = "vynl-system"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local OS integrations (MPRIS2/SMTC/MediaRemote, notifications, CLI/IPC) for vynl"
+
+[dependencies]
+vynl-core.workspace = true
+
+[lints]
+workspace = true

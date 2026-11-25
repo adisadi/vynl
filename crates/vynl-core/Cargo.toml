@@ -1,0 +1,11 @@
+[package]
+name = "vynl-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core domain models, Elm-style state reducer, configuration, and theme engine for vynl"
+
+[lints]
+workspace = true

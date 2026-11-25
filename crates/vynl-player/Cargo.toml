@@ -1,0 +1,23 @@
+[package]
+name = "vynl-player"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dual playback engine (librespot integrated player + Connect sync policy) for vynl"
+
+[features]
+default = ["rodio-backend"]
+# Cross-platform rodio/cpal backend (Linux/macOS/Windows)
+rodio-backend = []
+# 100% pure-Rust PCM subprocess backend (musl, FreeBSD, exotic targets)
+subprocess-backend = []
+# Optional FFT spectrum tap for Zen-mode audio visualizer
+visualizer = []
+
+[dependencies]
+vynl-core.workspace = true
+
+[lints]
+workspace = true

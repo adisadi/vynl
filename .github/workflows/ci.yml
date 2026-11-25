@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+# Pin all third-party action tags to immutable commit SHAs via Renovate
+# (configured in .github/renovate.json: helpers:pinGitHubActionDigests).
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  lint:
+    name: Format & Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux audio dev headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - run: cargo nextest run --workspace
+
+  feature-powerset:
+    name: Feature Powerset Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - run: cargo hack check --workspace --feature-powerset --no-dev-deps
+
+  msrv:
+    name: Rolling MSRV Check (1.90)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace
+
+  cross-compile:
+    name: Cross-Compile (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            features: "--no-default-features --features subprocess-backend"
+          - target: aarch64-unknown-linux-musl
+            features: "--no-default-features --features subprocess-backend"
+          - target: aarch64-unknown-linux-gnu
+            features: "--no-default-features"
+          - target: x86_64-unknown-freebsd
+            features: "--no-default-features --features subprocess-backend"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - uses: goto-bus-stop/setup-zig@v2
+      - name: Check cross-compilation target
+        run: cargo zigbuild -p vynl-tui --target ${{ matrix.target }} ${{ matrix.features }}
+
+  deny:
+    name: Supply-Chain & License Check (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  conventional-pr:
+    name: Conventional PR Title
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

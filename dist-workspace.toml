@@ -1,0 +1,25 @@
+# cargo-dist workspace configuration for automated cross-platform releases
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.28.0"
+ci = "github"
+installers = ["shell", "powershell", "homebrew"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]
+pr-run-mode = "plan"
+cargo-auditable = true
+cargo-cyclonedx = true
+github-attestations = true
+publish-jobs = ["homebrew"]
+tap = "OWNER/homebrew-tap"
+install-updater = true

@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+*.pdb
+lcov.info
+coverage/
+docs/book/book/
+.direnv/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json

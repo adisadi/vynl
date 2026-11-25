@@ -1,0 +1,51 @@
+name: Terminal Image Rendering Issue
+description: Report broken cover art, aspect-ratio distortion, flicker, or modal artifacts
+title: "bug(images): "
+labels: ["bug", "area:images", "triage"]
+body:
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal Emulator & Version
+      placeholder: "e.g., Kitty 0.40, Ghostty 1.1, WezTerm, Foot, Alacritty"
+    validations:
+      required: true
+  - type: dropdown
+    id: multiplexer
+    attributes:
+      label: Terminal Multiplexer
+      options:
+        - None
+        - tmux (allow-passthrough on)
+        - tmux (default / allow-passthrough off)
+        - Zellij
+        - GNU Screen
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: protocol
+    attributes:
+      label: Active Image Protocol
+      options:
+        - auto
+        - kitty
+        - iterm2
+        - sixel
+        - halfblocks
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `vynl doctor`
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Visual issue description & screenshots
+      description: Describe the rendering issue and attach a screenshot or recording if possible.
+    validations:
+      required: true

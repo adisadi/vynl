@@ -1,0 +1,30 @@
+[package]
+name = "vynl-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Cross-platform Rust TUI Spotify client with native terminal cover art"
+
+[[bin]]
+name = "vynl"
+path = "src/main.rs"
+
+[features]
+default = ["rodio-backend"]
+rodio-backend = ["vynl-player/rodio-backend"]
+subprocess-backend = ["vynl-player/subprocess-backend"]
+visualizer = ["vynl-player/visualizer"]
+
+[dependencies]
+vynl-core.workspace = true
+vynl-images.workspace = true
+vynl-player = { workspace = true, default-features = false }
+vynl-spotify.workspace = true
+vynl-system.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "vynl-spotify"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Lean pure-Rust Spotify Web API client, OAuth PKCE flow, rate-limiting, and redb cache contracts"
+
+[dependencies]
+vynl-core.workspace = true
+
+[lints]
+workspace = true

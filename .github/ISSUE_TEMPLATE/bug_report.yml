@@ -1,0 +1,46 @@
+name: Bug Report
+description: Report a crash, playback glitch, or unexpected behavior in vynl
+title: "bug: "
+labels: ["bug", "triage"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Clear description of the bug and what you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run `vynl`
+        2. Navigate to ...
+        3. Press ...
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `vynl doctor`
+      description: Run `vynl doctor` in the affected terminal and paste the output below.
+      render: shell
+    validations:
+      required: true
+  - type: dropdown
+    id: playback_mode
+    attributes:
+      label: Playback Mode
+      options:
+        - Integrated (librespot / rodio)
+        - Integrated (librespot / subprocess)
+        - Remote (Spotify Connect)
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log excerpt (sanitized)
+      description: From `~/.local/state/vynl/vynl.log` — remove any personal data or tokens.
+      render: text

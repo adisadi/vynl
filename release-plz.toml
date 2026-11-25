@@ -1,0 +1,13 @@
+[workspace]
+changelog_update = true
+dependencies_update = true
+git_release_enable = false # Handled by cargo-dist with SLSA attestations & SBOM
+pr_branch_prefix = "release-plz-"
+pr_labels = ["release"]
+semver_check = true
+
+[[package]]
+name = "vynl-tui"
+publish = true
+git_tag_enable = true
+git_tag_name = "v{{ version }}"

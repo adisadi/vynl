@@ -1,0 +1,24 @@
+{
+  "name": "vynl Rust Devcontainer",
+  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {},
+    "ghcr.io/guiyomh/features/just:0": {}
+  },
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libasound2-dev && cargo install --locked cargo-nextest cargo-deny cargo-insta cargo-hack",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "fill-labs.dependi",
+        "skellock.just"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy",
+        "rust-analyzer.check.extraArgs": ["--all-targets"],
+        "editor.formatOnSave": true
+      }
+    }
+  }
+}

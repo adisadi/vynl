@@ -1,0 +1,52 @@
+name: Release (cargo-dist + SLSA Provenance)
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build-and-attest:
+    name: Build & Attest (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            features: ""
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            features: "--no-default-features --features subprocess-backend"
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            features: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            features: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-auditable
+      - name: Build auditable release binary
+        run: cargo auditable build -p vynl-tui --release --target ${{ matrix.target }} ${{ matrix.features }}
+      - name: Generate SLSA Build Provenance Attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "target/${{ matrix.target }}/release/vynl*"
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vynl-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/vynl*

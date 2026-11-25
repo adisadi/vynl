@@ -1,0 +1,31 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    ":semanticCommits",
+    ":automergeMinor",
+    ":automergeDigest"
+  ],
+  "schedule": ["before 6am on Monday"],
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "description": "Group Rust dev/test crates together",
+      "matchManagers": ["cargo"],
+      "matchDepTypes": ["dev-dependencies"],
+      "groupName": "rust dev-dependencies"
+    },
+    {
+      "description": "Group GitHub Actions updates together",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions"
+    },
+    {
+      "description": "Require manual review for major releases and core audio/TUI crates",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["major"],
+      "automerge": false
+    }
+  ]
+}

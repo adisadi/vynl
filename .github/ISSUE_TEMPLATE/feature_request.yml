@@ -1,0 +1,24 @@
+name: Feature Request
+description: Propose a new feature or Spotify Desktop parity improvement
+title: "feat: "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Note: `vynl` is **strictly Spotify-only** (no external third-party cloud APIs such as LRCLIB, Last.fm, or Discord RPC).
+        For large architectural ideas, consider starting an RFC in GitHub Discussions first.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What workflow or Spotify Desktop capability is missing?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How should this work in the TUI / CLI?
+    validations:
+      required: true
