@@ -1001,7 +1001,12 @@ impl VynlApp {
                 self.dispatch(AppEvent::SetFocus(PanelFocus::Main));
             }
             KeyAction::OpenInlineFilter => {
-                self.dispatch(AppEvent::SetInlineFilter(Some(String::new())));
+                if self.state.focus == PanelFocus::Sidebar {
+                    self.dispatch(AppEvent::CycleLibraryFilter);
+                    self.clamp_selections();
+                } else {
+                    self.dispatch(AppEvent::SetInlineFilter(Some(String::new())));
+                }
             }
             KeyAction::OpenCommandPalette => {
                 self.dispatch(AppEvent::OpenModal(ActiveModal::CommandPalette {
@@ -1168,19 +1173,34 @@ impl VynlApp {
                     3 => Route::Podcasts,
                     4 => Route::ZenNowPlaying,
                     idx => {
-                        let pl_idx = idx.saturating_sub(5);
-                        if let Some(pl) = self.state.library.playlists.get(pl_idx) {
-                            let pl_id = pl.id.clone();
-                            if let Some(ref worker) = self.spotify_worker {
-                                let cached_snap = self.playlist_snapshots.get(&pl_id).cloned();
-                                worker.send(BackendRequest::FetchPlaylistTracks {
-                                    playlist_id: pl_id.clone(),
-                                    cached_snapshot_id: cached_snap,
-                                });
+                        let list_idx = idx.saturating_sub(5);
+                        match self.state.library_filter {
+                            vynl_core::model::LibraryFilter::All
+                            | vynl_core::model::LibraryFilter::Playlists => {
+                                let Some(pl) = self.state.library.playlists.get(list_idx) else {
+                                    return;
+                                };
+                                let pl_id = pl.id.clone();
+                                self.request_playlist_tracks(&pl_id);
+                                Route::Playlist(pl_id)
                             }
-                            Route::Playlist(pl_id)
-                        } else {
-                            return;
+                            vynl_core::model::LibraryFilter::Albums => {
+                                let Some(alb) = self.state.library.albums.get(list_idx) else {
+                                    return;
+                                };
+                                let alb_id = alb.id.clone();
+                                self.request_album_tracks(&alb_id);
+                                Route::Album(alb_id)
+                            }
+                            vynl_core::model::LibraryFilter::Artists => {
+                                let Some(artist) = self.state.library.artists.get(list_idx) else {
+                                    return;
+                                };
+                                let artist_id = artist.id.clone();
+                                self.request_artist_top_tracks(&artist_id);
+                                Route::Artist(artist_id)
+                            }
+                            vynl_core::model::LibraryFilter::Podcasts => Route::Podcasts,
                         }
                     }
                 };
@@ -1198,8 +1218,42 @@ impl VynlApp {
         }
     }
 
+    fn request_playlist_tracks(&self, playlist_id: &str) {
+        if let Some(ref worker) = self.spotify_worker {
+            let cached_snap = self.playlist_snapshots.get(playlist_id).cloned();
+            worker.send(BackendRequest::FetchPlaylistTracks {
+                playlist_id: playlist_id.to_owned(),
+                cached_snapshot_id: cached_snap,
+            });
+        }
+    }
+
+    fn request_album_tracks(&self, album_id: &str) {
+        if let Some(ref worker) = self.spotify_worker {
+            worker.send(BackendRequest::FetchAlbumTracks {
+                album_id: album_id.to_owned(),
+            });
+        }
+    }
+
+    fn request_artist_top_tracks(&self, artist_id: &str) {
+        if let Some(ref worker) = self.spotify_worker {
+            worker.send(BackendRequest::FetchArtistTopTracks {
+                artist_id: artist_id.to_owned(),
+            });
+        }
+    }
+
     fn clamp_selections(&mut self) {
-        let sidebar_len = 5 + self.state.library.playlists.len();
+        let filter_items = match self.state.library_filter {
+            vynl_core::model::LibraryFilter::All | vynl_core::model::LibraryFilter::Playlists => {
+                self.state.library.playlists.len()
+            }
+            vynl_core::model::LibraryFilter::Albums => self.state.library.albums.len(),
+            vynl_core::model::LibraryFilter::Artists => self.state.library.artists.len(),
+            vynl_core::model::LibraryFilter::Podcasts => self.state.library.episodes.len(),
+        };
+        let sidebar_len = 5 + filter_items;
         if sidebar_len > 0 {
             self.state.sidebar_selected = self.state.sidebar_selected.min(sidebar_len - 1);
         }
@@ -1330,12 +1384,24 @@ impl VynlApp {
                 )
             }
             IpcCommand::OpenUri(uri) => {
-                if let Some(track_id) = uri.strip_prefix("spotify:track:")
-                    && let Some(ref worker) = self.spotify_worker
-                {
-                    worker.send(BackendRequest::Command(
-                        vynl_core::state::AppCommand::PlayTrackId(track_id.to_owned()),
-                    ));
+                if let Some(track_id) = uri.strip_prefix("spotify:track:") {
+                    if let Some(ref worker) = self.spotify_worker {
+                        worker.send(BackendRequest::Command(
+                            vynl_core::state::AppCommand::PlayTrackId(track_id.to_owned()),
+                        ));
+                    }
+                } else if let Some(playlist_id) = uri.strip_prefix("spotify:playlist:") {
+                    self.request_playlist_tracks(playlist_id);
+                    self.dispatch(AppEvent::Navigate(Route::Playlist(playlist_id.to_owned())));
+                    self.dispatch(AppEvent::SetFocus(PanelFocus::Main));
+                } else if let Some(album_id) = uri.strip_prefix("spotify:album:") {
+                    self.request_album_tracks(album_id);
+                    self.dispatch(AppEvent::Navigate(Route::Album(album_id.to_owned())));
+                    self.dispatch(AppEvent::SetFocus(PanelFocus::Main));
+                } else if let Some(artist_id) = uri.strip_prefix("spotify:artist:") {
+                    self.request_artist_top_tracks(artist_id);
+                    self.dispatch(AppEvent::Navigate(Route::Artist(artist_id.to_owned())));
+                    self.dispatch(AppEvent::SetFocus(PanelFocus::Main));
                 }
                 self.dispatch(AppEvent::ShowToast {
                     level: ToastLevel::Info,
@@ -1805,5 +1871,48 @@ border = "#242844"
         }
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sidebar_library_filter_and_ipc_open_uri_navigate_albums_artists_and_playlists() {
+        let mut app = VynlApp::new_demo(ImageProtocol::Halfblocks);
+
+        // Cycle Sidebar filter: All -> Playlists -> Albums
+        app.state.focus = vynl_core::state::PanelFocus::Sidebar;
+        app.handle_key(KeyEvent::plain(KeyCode::Char('f')));
+        assert_eq!(
+            app.state.library_filter,
+            vynl_core::model::LibraryFilter::Playlists
+        );
+        app.handle_key(KeyEvent::plain(KeyCode::Char('f')));
+        assert_eq!(
+            app.state.library_filter,
+            vynl_core::model::LibraryFilter::Albums
+        );
+
+        // Select first album in sidebar (index 5) and press Enter -> navigates to Route::Album
+        app.state.sidebar_selected = 5;
+        app.handle_key(KeyEvent::plain(KeyCode::Enter));
+        assert!(matches!(app.state.route, Route::Album(_)));
+        assert_ne!(app.active_view_tracks().len(), 0);
+
+        // IPC OpenUri routes spotify:album:, spotify:artist:, spotify:playlist:
+        let resp_artist = app.handle_ipc_command(IpcCommand::OpenUri(String::from(
+            "spotify:artist:art-daft-punk",
+        )));
+        assert!(resp_artist.ok);
+        assert_eq!(
+            app.state.route,
+            Route::Artist(String::from("art-daft-punk"))
+        );
+
+        let resp_playlist = app.handle_ipc_command(IpcCommand::OpenUri(String::from(
+            "spotify:playlist:pl-late-night",
+        )));
+        assert!(resp_playlist.ok);
+        assert_eq!(
+            app.state.route,
+            Route::Playlist(String::from("pl-late-night"))
+        );
     }
 }
