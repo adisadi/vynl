@@ -1,8 +1,16 @@
-//! Lean, pure-Rust Spotify Web API contracts, OAuth 2.0 PKCE state machine,
-//! HTTP 429 rate-limit backoff policy, and `redb` cache traits.
+//! Lean, pure-Rust Spotify Web API client, OAuth 2.0 PKCE state machine,
+//! RFC 8259 JSON parser, HTTP 429 rate-limit backoff policy, offline demo catalog,
+//! and atomic metadata cache contracts.
 //!
 //! Per ADR-0001 and ADR-0003, this crate communicates exclusively with
-//! official Spotify endpoints via `rustls` and persists metadata via `redb`.
+//! official Spotify endpoints and persists metadata locally without native C
+//! library dependencies.
+
+pub mod api;
+pub mod cache;
+pub mod demo;
+pub mod json;
+pub mod pkce;
 
 use std::time::Duration;
 
@@ -39,6 +47,7 @@ pub enum AuthState {
 }
 
 /// Determines the initial authentication state from user configuration.
+#[must_use]
 pub fn initial_auth_state(config: &vynl_core::config::SpotifyConfig) -> AuthState {
     match config.client_id.as_deref().map(str::trim) {
         Some(id) if !id.is_empty() => AuthState::AwaitingCallback {
@@ -52,6 +61,7 @@ pub fn initial_auth_state(config: &vynl_core::config::SpotifyConfig) -> AuthStat
 ///
 /// Always honors `Retry-After` (in seconds) when provided, with a minimum safety
 /// floor of 1 second and a cap of 120 seconds.
+#[must_use]
 pub fn rate_limit_delay(retry_after_secs: Option<u64>, attempt: u32) -> Duration {
     if let Some(secs) = retry_after_secs {
         return Duration::from_secs(secs.clamp(1, 120));
@@ -62,6 +72,7 @@ pub fn rate_limit_delay(retry_after_secs: Option<u64>, attempt: u32) -> Duration
 
 /// Classifies whether a Spotify API error represents a restricted endpoint (`403`)
 /// that should degrade gracefully without surfacing an error modal (ADR-0003).
+#[must_use]
 pub const fn is_gracefully_degradable_status(http_status: u16) -> bool {
     http_status == 403
 }

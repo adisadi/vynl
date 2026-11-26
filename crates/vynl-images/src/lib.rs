@@ -1,163 +1,161 @@
-//! Terminal graphics protocol selection, smart list-thumbnail scaling, and
-//! **Modal-Aware Image Occlusion** geometry (ADR-0004).
+//! Pure-Rust terminal image engine for `vynl`.
+//!
+//! Provides:
+//! - Terminal graphics protocol detection and encoders for Kitty, `iTerm2`, Sixel,
+//!   and 24-bit `TrueColor` Unicode halfblocks.
+//! - `RGB24` image buffer, nearest/bilinear resizing, aspect-ratio cell fitting,
+//!   PPM (`P6`) and BMP codecs, `Base64` encoding, procedural demo cover synthesis,
+//!   and dominant color palette extraction for WCAG-AA adaptive themes.
+//! - Two-tier bounded caching (`L1ImageCache` in-memory LRU + `L2DiskCache` PPM LRU)
+//!   and a non-blocking prioritized background [`ImageWorker`] with viewport cancellation.
+//! - **Modal-Aware Image Occlusion** geometry and per-frame [`OcclusionTracker`] (ADR-0004).
 
-use vynl_core::config::ListThumbnailPolicy;
+pub mod cache;
+pub mod image;
+pub mod occlusion;
+pub mod protocol;
+pub mod worker;
 
-/// Resolved terminal image protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImageProtocol {
-    /// Kitty Graphics Protocol (Kitty, Ghostty, `WezTerm`).
-    Kitty,
-    /// `iTerm2` Inline Images (`iTerm2`, `WezTerm`, Konsole).
-    ITerm2,
-    /// Sixel graphics (Foot, `XTerm`, Windows Terminal).
-    Sixel,
-    /// 24-bit `TrueColor` Unicode halfblocks (`▀`/`▄`).
-    Halfblocks,
-}
-
-impl ImageProtocol {
-    /// Human-readable label for `vynl doctor` and UI status.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Kitty => "kitty",
-            Self::ITerm2 => "iterm2",
-            Self::Sixel => "sixel",
-            Self::Halfblocks => "halfblocks",
-        }
-    }
-
-    /// Best-effort environment heuristic (Phase 1 augments this with `ratatui-image`
-    /// terminal queries and `tmux` passthrough probing).
-    pub fn detect_from_env(
-        term_program: Option<&str>,
-        term: Option<&str>,
-        kitty_window_id: Option<&str>,
-        in_tmux: bool,
-    ) -> Self {
-        if in_tmux {
-            // Safe default until tmux `allow-passthrough` is verified via query.
-            return Self::Halfblocks;
-        }
-        if kitty_window_id.is_some() {
-            return Self::Kitty;
-        }
-        match term_program.unwrap_or_default() {
-            "ghostty" | "WezTerm" | "kitty" => Self::Kitty,
-            "iTerm.app" => Self::ITerm2,
-            _ => match term.unwrap_or_default() {
-                "xterm-kitty" | "xterm-ghostty" => Self::Kitty,
-                "foot" | "foot-extra" | "mlterm" => Self::Sixel,
-                _ => Self::Halfblocks,
-            },
-        }
-    }
-
-    /// Applies smart protocol scaling to decide whether small thumbnails inside
-    /// scrolling track/search lists should be rendered.
-    pub const fn render_list_thumbnails(self, policy: ListThumbnailPolicy) -> bool {
-        match policy {
-            ListThumbnailPolicy::Always => true,
-            ListThumbnailPolicy::Never => false,
-            ListThumbnailPolicy::Auto => matches!(self, Self::Kitty | Self::ITerm2),
-        }
-    }
-}
-
-/// Terminal cell rectangle used for Modal-Aware Image Occlusion checks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CellRect {
-    /// Left column (0-indexed).
-    pub x: u16,
-    /// Top row (0-indexed).
-    pub y: u16,
-    /// Width in character cells.
-    pub width: u16,
-    /// Height in character cells.
-    pub height: u16,
-}
-
-impl CellRect {
-    /// Constructs a new terminal cell rectangle.
-    pub const fn new(x: u16, y: u16, width: u16, height: u16) -> Self {
-        Self {
-            x,
-            y,
-            width,
-            height,
-        }
-    }
-
-    /// Returns `true` if `self` and `other` share at least one terminal cell.
-    pub const fn intersects(self, other: Self) -> bool {
-        if self.width == 0 || self.height == 0 || other.width == 0 || other.height == 0 {
-            return false;
-        }
-        let self_right = self.x.saturating_add(self.width);
-        let self_bottom = self.y.saturating_add(self.height);
-        let other_right = other.x.saturating_add(other.width);
-        let other_bottom = other.y.saturating_add(other.height);
-
-        self.x < other_right
-            && self_right > other.x
-            && self.y < other_bottom
-            && self_bottom > other.y
-    }
-}
-
-/// Determines whether an image slot should be suppressed while a floating modal
-/// occupies `modal_rect` (prevents Kitty/Sixel Z-order bleeding artifacts).
-pub const fn is_occluded_by_modal(image_rect: CellRect, modal_rect: Option<CellRect>) -> bool {
-    match modal_rect {
-        Some(modal) => image_rect.intersects(modal),
-        None => false,
-    }
-}
+pub use crate::cache::{CachedFrame, ImageCacheKey, L1ImageCache, L2DiskCache};
+pub use crate::image::{RgbImage, encode_base64, fnv1a_64, generate_demo_cover};
+pub use crate::occlusion::{CellRect, ImageSlot, OcclusionTracker, is_occluded_by_modal};
+pub use crate::protocol::{
+    EncodedImage, ImageProtocol, encode_for_protocol, encode_halfblocks, encode_iterm2,
+    encode_kitty, encode_sixel,
+};
+pub use crate::worker::{
+    DemoImageSource, ImagePriority, ImageReady, ImageRequest, ImageSource, ImageWorker,
+};
 
 #[cfg(test)]
 mod tests {
-    use vynl_core::config::ListThumbnailPolicy;
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
 
-    use super::{CellRect, ImageProtocol, is_occluded_by_modal};
+    use vynl_core::theme::{Theme, WCAG_AA_MIN_CONTRAST};
+
+    use crate::{
+        CachedFrame, CellRect, EncodedImage, ImagePriority, ImageProtocol, ImageRequest,
+        ImageSource, ImageWorker, L1ImageCache, OcclusionTracker, RgbImage, encode_for_protocol,
+        generate_demo_cover,
+    };
 
     #[test]
-    fn smart_protocol_scaling_enables_list_thumbnails_on_fast_protocols_only() {
-        assert!(ImageProtocol::Kitty.render_list_thumbnails(ListThumbnailPolicy::Auto));
-        assert!(ImageProtocol::ITerm2.render_list_thumbnails(ListThumbnailPolicy::Auto));
-        assert!(!ImageProtocol::Sixel.render_list_thumbnails(ListThumbnailPolicy::Auto));
-        assert!(!ImageProtocol::Halfblocks.render_list_thumbnails(ListThumbnailPolicy::Auto));
-        assert!(ImageProtocol::Halfblocks.render_list_thumbnails(ListThumbnailPolicy::Always));
-        assert!(!ImageProtocol::Kitty.render_list_thumbnails(ListThumbnailPolicy::Never));
+    fn demo_cover_palette_integrates_with_adaptive_theme_wcag_aa() {
+        let base = Theme::vynl_dark();
+        let cover = generate_demo_cover("spotify:album:vynl-demo-01", 64);
+        let palette = cover.extract_dominant_palette(5);
+        assert_ne!(palette, []);
+
+        let adapted = base.with_adaptive_palette(&palette);
+        assert!(adapted.accent.contrast_ratio(adapted.background) >= WCAG_AA_MIN_CONTRAST);
+        assert!(adapted.accent.contrast_ratio(adapted.surface) >= WCAG_AA_MIN_CONTRAST);
     }
 
     #[test]
-    fn detects_known_terminals_and_falls_back_in_tmux() {
-        assert_eq!(
-            ImageProtocol::detect_from_env(Some("ghostty"), None, None, false),
-            ImageProtocol::Kitty
-        );
-        assert_eq!(
-            ImageProtocol::detect_from_env(Some("iTerm.app"), None, None, false),
-            ImageProtocol::ITerm2
-        );
-        assert_eq!(
-            ImageProtocol::detect_from_env(None, Some("foot"), None, false),
-            ImageProtocol::Sixel
-        );
-        assert_eq!(
-            ImageProtocol::detect_from_env(Some("ghostty"), None, Some("1"), true),
-            ImageProtocol::Halfblocks
-        );
+    fn all_four_protocols_encode_non_empty_frames() {
+        let cover = generate_demo_cover("spotify:album:all-protocols", 32);
+
+        for protocol in [
+            ImageProtocol::Kitty,
+            ImageProtocol::ITerm2,
+            ImageProtocol::Sixel,
+            ImageProtocol::Halfblocks,
+        ] {
+            let encoded = encode_for_protocol(&cover, protocol, 10, 5, 8, 16);
+            assert_eq!(encoded.protocol(), protocol);
+            assert!(encoded.byte_len() > 0);
+        }
+    }
+
+    struct BlockingSource {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    impl ImageSource for BlockingSource {
+        fn load(&self, url: &str) -> Result<RgbImage, String> {
+            if url == "gate" {
+                let _ = self.entered.wait();
+                let _ = self.release.wait();
+            }
+            Ok(generate_demo_cover(url, 16))
+        }
     }
 
     #[test]
-    fn modal_occlusion_suppresses_only_overlapping_image_rects() {
-        let cover = CellRect::new(10, 5, 20, 10);
-        let overlapping_modal = CellRect::new(25, 10, 40, 15);
-        let disjoint_modal = CellRect::new(40, 5, 30, 10);
+    fn worker_prioritizes_high_over_low_requests_and_populates_l1_cache() -> Result<(), String> {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let source: Arc<dyn ImageSource> = Arc::new(BlockingSource {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        // Single worker thread guarantees deterministic ordering after gate opens.
+        let worker = ImageWorker::spawn(1, &source, None)?;
 
-        assert!(is_occluded_by_modal(cover, Some(overlapping_modal)));
-        assert!(!is_occluded_by_modal(cover, Some(disjoint_modal)));
-        assert!(!is_occluded_by_modal(cover, None));
+        let make_req = |id: u64, url: &str, priority: ImagePriority| ImageRequest {
+            id,
+            viewport_epoch: 0,
+            url: String::from(url),
+            cols: 8,
+            rows: 4,
+            cell_px_w: 8,
+            cell_px_h: 16,
+            protocol: ImageProtocol::Halfblocks,
+            priority,
+            palette_colors: 3,
+        };
+
+        // First request occupies the worker thread; wait until it has been dequeued.
+        worker.submit(make_req(1, "gate", ImagePriority::Normal))?;
+        let _ = entered.wait();
+
+        // Queue low-priority then high-priority while worker is blocked on release.
+        worker.submit(make_req(2, "low-thumb", ImagePriority::Low))?;
+        worker.submit(make_req(3, "high-hero", ImagePriority::High))?;
+
+        // Release the worker thread.
+        let _ = release.wait();
+
+        let r1 = worker
+            .recv_timeout(Duration::from_secs(2))
+            .ok_or_else(|| String::from("missing gate response"))?;
+        let r2 = worker
+            .recv_timeout(Duration::from_secs(2))
+            .ok_or_else(|| String::from("missing second response"))?;
+        let r3 = worker
+            .recv_timeout(Duration::from_secs(2))
+            .ok_or_else(|| String::from("missing third response"))?;
+
+        assert_eq!(r1.id, 1);
+        assert_eq!(r2.id, 3); // High priority preempted Low priority!
+        assert_eq!(r3.id, 2);
+
+        let mut l1 = L1ImageCache::new(4);
+        let key = r2.key.clone();
+        l1.insert(
+            key.clone(),
+            CachedFrame {
+                encoded: r2.encoded,
+                palette: r2.palette,
+            },
+        );
+        let cached = l1
+            .get(&key)
+            .ok_or_else(|| String::from("expected cached frame in L1"))?;
+        assert!(matches!(cached.encoded, EncodedImage::Halfblocks(ref rows) if rows.len() == 4));
+
+        // Verify occlusion tracker integration with modal bounds.
+        let mut tracker = OcclusionTracker::new();
+        tracker.register_slot("hero", CellRect::new(4, 4, 16, 8), "high-hero");
+        tracker.register_slot("footer", CellRect::new(2, 24, 8, 4), "low-thumb");
+        let modal = Some(CellRect::new(10, 6, 30, 10));
+        let visible = tracker.visible_slots(modal);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, "footer");
+
+        worker.shutdown();
+        Ok(())
     }
 }

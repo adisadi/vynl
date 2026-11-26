@@ -1,4 +1,6 @@
-//! Modular theme definitions, built-in presets, and WCAG-AA contrast utilities.
+//! Modular theme definitions, built-in presets, custom TOML loading, and WCAG-AA contrast math.
+
+use crate::config::{parse_toml_string, strip_toml_comment};
 
 /// 24-bit sRGB color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,11 +15,34 @@ pub struct Rgb {
 
 impl Rgb {
     /// Constructs a new sRGB color.
+    #[must_use]
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
 
+    /// Parses `#RRGGBB` hex color notation.
+    ///
+    /// # Errors
+    /// Returns an error if `hex` is not a valid 6-digit hex color with leading `#`.
+    pub fn from_hex(hex: &str) -> Result<Self, String> {
+        let s = hex.trim();
+        let bytes = s
+            .strip_prefix('#')
+            .ok_or_else(|| format!("expected `#RRGGBB`, got `{hex}`"))?;
+        if bytes.len() != 6 {
+            return Err(format!("expected 6 hex digits in `{hex}`"));
+        }
+        let r = u8::from_str_radix(&bytes[0..2], 16)
+            .map_err(|_| format!("invalid red hex in `{hex}`"))?;
+        let g = u8::from_str_radix(&bytes[2..4], 16)
+            .map_err(|_| format!("invalid green hex in `{hex}`"))?;
+        let b = u8::from_str_radix(&bytes[4..6], 16)
+            .map_err(|_| format!("invalid blue hex in `{hex}`"))?;
+        Ok(Self { r, g, b })
+    }
+
     /// Computes relative luminance per WCAG 2.1 (`0.0..=1.0`).
+    #[must_use]
     pub fn relative_luminance(self) -> f64 {
         let linearize = |channel: u8| -> f64 {
             let s = f64::from(channel) / 255.0;
@@ -32,11 +57,27 @@ impl Rgb {
     }
 
     /// Computes the WCAG 2.1 contrast ratio between `self` and `other` (`1.0..=21.0`).
+    #[must_use]
     pub fn contrast_ratio(self, other: Self) -> f64 {
         let l1 = self.relative_luminance();
         let l2 = other.relative_luminance();
         let (lighter, darker) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
         (lighter + 0.05) / (darker + 0.05)
+    }
+
+    /// Gently brightens a color toward white by `factor` (`0.0..=1.0`) to rescue
+    /// dark cover accents so they satisfy WCAG-AA contrast.
+    #[must_use]
+    pub fn lighten(self, factor: f64) -> Self {
+        let f = factor.clamp(0.0, 1.0);
+        let lift = |c: u8| -> u8 {
+            let v = f64::from(c) + (255.0 - f64::from(c)) * f;
+            // Clamp ensures lossless non-negative conversion.
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let rounded = v.round().clamp(0.0, 255.0) as u8;
+            rounded
+        };
+        Self::new(lift(self.r), lift(self.g), lift(self.b))
     }
 }
 
@@ -62,19 +103,44 @@ pub struct Theme {
     pub border: Rgb,
 }
 
+impl Default for Theme {
+    fn default() -> Self {
+        Self::vynl_dark()
+    }
+}
+
 impl Theme {
+    /// Built-in default dark theme.
+    #[must_use]
+    pub fn vynl_dark() -> Self {
+        Self {
+            name: String::from("vynl-dark"),
+            background: Rgb::new(18, 18, 18),
+            surface: Rgb::new(24, 24, 24),
+            text_primary: Rgb::new(245, 245, 245),
+            text_muted: Rgb::new(167, 167, 167),
+            accent: Rgb::new(29, 185, 84),
+            border: Rgb::new(48, 48, 48),
+        }
+    }
+
+    /// Names of all built-in community presets.
+    #[must_use]
+    pub const fn builtin_names() -> &'static [&'static str] {
+        &[
+            "vynl-dark",
+            "catppuccin-mocha",
+            "tokyo-night",
+            "gruvbox",
+            "nord",
+        ]
+    }
+
     /// Returns a built-in community theme preset by name.
+    #[must_use]
     pub fn builtin(name: &str) -> Option<Self> {
         match name {
-            "vynl-dark" => Some(Self {
-                name: String::from("vynl-dark"),
-                background: Rgb::new(18, 18, 18),
-                surface: Rgb::new(24, 24, 24),
-                text_primary: Rgb::new(245, 245, 245),
-                text_muted: Rgb::new(167, 167, 167),
-                accent: Rgb::new(29, 185, 84),
-                border: Rgb::new(48, 48, 48),
-            }),
+            "vynl-dark" => Some(Self::vynl_dark()),
             "catppuccin-mocha" => Some(Self {
                 name: String::from("catppuccin-mocha"),
                 background: Rgb::new(30, 30, 46),
@@ -115,6 +181,39 @@ impl Theme {
         }
     }
 
+    /// Parses a custom community theme file (`~/.config/vynl/themes/<name>.toml`).
+    ///
+    /// # Errors
+    /// Returns an error on invalid TOML syntax or malformed `#RRGGBB` hex colors.
+    pub fn from_toml(name: &str, input: &str) -> Result<Self, String> {
+        let mut theme = Self::vynl_dark();
+        name.clone_into(&mut theme.name);
+
+        for (idx, raw_line) in input.lines().enumerate() {
+            let line_no = idx + 1;
+            let line = strip_toml_comment(raw_line).trim();
+            if line.is_empty() || (line.starts_with('[') && line.ends_with(']')) {
+                continue;
+            }
+            let Some((raw_key, raw_val)) = line.split_once('=') else {
+                return Err(format!("line {line_no}: expected `key = \"#RRGGBB\"`"));
+            };
+            let key = raw_key.trim();
+            let val = parse_toml_string(raw_val.trim(), line_no)?;
+            match key {
+                "name" => theme.name = val,
+                "background" => theme.background = Rgb::from_hex(&val)?,
+                "surface" => theme.surface = Rgb::from_hex(&val)?,
+                "text_primary" => theme.text_primary = Rgb::from_hex(&val)?,
+                "text_muted" => theme.text_muted = Rgb::from_hex(&val)?,
+                "accent" => theme.accent = Rgb::from_hex(&val)?,
+                "border" => theme.border = Rgb::from_hex(&val)?,
+                _ => {}
+            }
+        }
+        Ok(theme)
+    }
+
     /// Returns a copy of this theme with `accent` overridden only if the candidate
     /// satisfies WCAG-AA contrast against both `background` and `surface`.
     #[must_use]
@@ -127,6 +226,28 @@ impl Theme {
         }
         next
     }
+
+    /// Picks the highest-contrast candidate from a cover palette, gently lifting
+    /// luminance if needed to meet WCAG-AA while preserving hue character.
+    #[must_use]
+    pub fn with_adaptive_palette(&self, candidates: &[Rgb]) -> Self {
+        for &color in candidates {
+            if color.contrast_ratio(self.background) >= WCAG_AA_MIN_CONTRAST
+                && color.contrast_ratio(self.surface) >= WCAG_AA_MIN_CONTRAST
+            {
+                return self.with_adaptive_accent(color);
+            }
+        }
+        for &color in candidates {
+            let lifted = color.lighten(0.35);
+            if lifted.contrast_ratio(self.background) >= WCAG_AA_MIN_CONTRAST
+                && lifted.contrast_ratio(self.surface) >= WCAG_AA_MIN_CONTRAST
+            {
+                return self.with_adaptive_accent(lifted);
+            }
+        }
+        self.clone()
+    }
 }
 
 #[cfg(test)]
@@ -135,13 +256,7 @@ mod tests {
 
     #[test]
     fn all_builtin_presets_satisfy_wcag_aa_for_primary_text_and_accent() {
-        for preset in [
-            "vynl-dark",
-            "catppuccin-mocha",
-            "tokyo-night",
-            "gruvbox",
-            "nord",
-        ] {
+        for preset in Theme::builtin_names() {
             let Some(theme) = Theme::builtin(preset) else {
                 unreachable!("builtin preset must exist");
             };
@@ -157,10 +272,25 @@ mod tests {
     }
 
     #[test]
+    fn custom_toml_theme_parses_hex_colors() -> Result<(), String> {
+        let toml = r##"
+            name = "rose-pine"
+            background = "#191724"
+            surface = "#1f1d2e"
+            text_primary = "#e0def4"
+            text_muted = "#908caa"
+            accent = "#ebbcba"
+            border = "#403d52"
+        "##;
+        let theme = Theme::from_toml("rose-pine", toml)?;
+        assert_eq!(theme.name, "rose-pine");
+        assert_eq!(theme.accent, Rgb::new(0xeb, 0xbc, 0xba));
+        Ok(())
+    }
+
+    #[test]
     fn adaptive_accent_rejects_low_contrast_color() {
-        let Some(base) = Theme::builtin("vynl-dark") else {
-            unreachable!("vynl-dark must exist");
-        };
+        let base = Theme::vynl_dark();
         let too_dark = Rgb::new(30, 30, 30);
         let kept = base.with_adaptive_accent(too_dark);
         assert_eq!(kept.accent, base.accent);
