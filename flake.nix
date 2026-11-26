@@ -25,7 +25,7 @@
           buildInputs = linuxBuildDeps;
           meta = with pkgs.lib; {
             description = "Cross-platform Rust TUI Spotify client with native terminal cover art";
-            homepage = "https://github.com/OWNER/vynl";
+            homepage = "https://github.com/adisadi/vynl";
             license = licenses.gpl3Plus;
             mainProgram = "vynl";
           };

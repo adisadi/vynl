@@ -2,8 +2,8 @@
 
 **A cross-platform Rust TUI Spotify client with native terminal cover art.**
 
-[![CI](https://github.com/OWNER/vynl/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/vynl/actions/workflows/ci.yml)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/OWNER/vynl/badge)](https://scorecard.dev/viewer/?uri=github.com/OWNER/vynl)
+[![CI](https://github.com/adisadi/vynl/actions/workflows/ci.yml/badge.svg)](https://github.com/adisadi/vynl/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/adisadi/vynl/badge)](https://scorecard.dev/viewer/?uri=github.com/adisadi/vynl)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
 
 `vynl` brings the full Spotify Desktop experience into your terminal — complete with crisp album art, artist portraits, adaptive cover-color themes, integrated audio playback, and native OS media controls — built with a **cross-compile-first, pure-Rust** architecture.

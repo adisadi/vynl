@@ -5,6 +5,6 @@ language = "en"
 src = "src"
 
 [output.html]
-git-repository-url = "https://github.com/OWNER/vynl"
+git-repository-url = "https://github.com/adisadi/vynl"
 default-theme = "ayu"
 preferred-dark-theme = "ayu"
