@@ -1,8 +1,9 @@
 //! Local desktop notification dispatching for `vynl`.
 //!
 //! Dispatches track-change notifications exclusively to the local OS notification
-//! center (`notify-send` on Linux, `osascript` on macOS) without any cloud calls,
-//! and provides [`RecordingNotifier`] for deterministic automated testing.
+//! center (pure-Rust D-Bus `org.freedesktop.Notifications` with `notify-send`
+//! fallback on Linux, `osascript` on macOS) without any cloud calls, and provides
+//! [`RecordingNotifier`] for deterministic automated testing.
 
 use std::fmt;
 use std::io;
@@ -112,17 +113,21 @@ pub trait NotificationDispatcher: Send + Sync {
 
 /// Local OS notification dispatcher.
 ///
-/// Invokes `notify-send` on Linux and `osascript` on macOS non-blockingly when
-/// installed, reaping spawned child processes on a background thread so the TUI
-/// event loop is never blocked and no zombie processes accumulate. If the OS
-/// helper binary is not installed or notifications are disabled, this dispatcher
-/// gracefully returns [`DispatchStatus::Skipped`].
+/// On Linux, dispatches via pure-Rust D-Bus (`org.freedesktop.Notifications`) when
+/// a session bus is present and falls back to `notify-send` non-blockingly. On
+/// macOS, invokes `osascript` non-blockingly. Any spawned child processes are
+/// reaped on a background thread so the TUI event loop is never blocked and no
+/// zombie processes accumulate. If no notification daemon or helper binary is
+/// available, or if notifications are disabled, this dispatcher gracefully returns
+/// [`DispatchStatus::Skipped`].
 #[derive(Debug, Clone)]
 pub struct LocalOsNotifier {
     enabled: bool,
     app_name: String,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     linux_command: PathBuf,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    use_custom_linux_command: bool,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     macos_command: PathBuf,
 }
@@ -141,6 +146,7 @@ impl LocalOsNotifier {
             enabled: true,
             app_name: String::from("vynl"),
             linux_command: PathBuf::from("notify-send"),
+            use_custom_linux_command: false,
             macos_command: PathBuf::from("osascript"),
         }
     }
@@ -156,6 +162,7 @@ impl LocalOsNotifier {
     #[must_use]
     pub fn with_linux_command(mut self, command: impl Into<PathBuf>) -> Self {
         self.linux_command = command.into();
+        self.use_custom_linux_command = true;
         self
     }
 
@@ -189,11 +196,50 @@ impl NotificationDispatcher for LocalOsNotifier {
 }
 
 #[cfg(target_os = "linux")]
+fn has_dbus_session_bus() -> bool {
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|val| !val.is_empty()) {
+        return true;
+    }
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR")
+        && !runtime_dir.is_empty()
+    {
+        return std::path::Path::new(&runtime_dir).join("bus").exists();
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn try_dispatch_dbus_notification(app_name: &str, payload: &NotificationPayload) -> bool {
+    if !has_dbus_session_bus() {
+        return false;
+    }
+
+    let mut notification = notify_rust::Notification::new();
+    notification
+        .appname(app_name)
+        .summary(&payload.title)
+        .body(&payload.body);
+
+    if let Some(path) = &payload.icon_path {
+        let icon = path.to_string_lossy();
+        notification.icon(&icon);
+    }
+
+    notification.show().is_ok()
+}
+
+#[cfg(target_os = "linux")]
 fn dispatch_os_notification(
     notifier: &LocalOsNotifier,
     payload: &NotificationPayload,
 ) -> Result<DispatchStatus, NotificationError> {
     use std::process::{Command, Stdio};
+
+    if !notifier.use_custom_linux_command
+        && try_dispatch_dbus_notification(&notifier.app_name, payload)
+    {
+        return Ok(DispatchStatus::Dispatched);
+    }
 
     let mut command = Command::new(&notifier.linux_command);
     command
@@ -444,5 +490,30 @@ mod tests {
         );
         track.artists.clear();
         assert_eq!(format_notification_summary(&track), "Instant Crush");
+    }
+
+    #[test]
+    fn local_os_notifier_handles_headless_environment_with_and_without_icon() -> Result<(), String>
+    {
+        let notifier = LocalOsNotifier::new();
+        let plain = NotificationPayload::new("Now Playing", "Daft Punk · Discovery", None);
+        let with_icon = NotificationPayload::new(
+            "Now Playing",
+            "Daft Punk · Discovery",
+            Some(PathBuf::from("/tmp/vynl-headless-cover.png")),
+        );
+
+        let status_plain = notifier.notify(&plain).map_err(|err| err.to_string())?;
+        let status_icon = notifier.notify(&with_icon).map_err(|err| err.to_string())?;
+
+        assert!(matches!(
+            status_plain,
+            DispatchStatus::Dispatched | DispatchStatus::Skipped
+        ));
+        assert!(matches!(
+            status_icon,
+            DispatchStatus::Dispatched | DispatchStatus::Skipped
+        ));
+        Ok(())
     }
 }

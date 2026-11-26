@@ -1,0 +1,38 @@
+---
+source: crates/vynl-tui/tests/snapshots.rs
+expression: frame.to_plain_text()
+---
+╭─ vynl ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│[<]         / Search songs, artists, albums... (Ctrl+P Palette)                                                 Vinyl Explorer [?]        │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ Library ────────────────╮╭─ Home ───────────────────────────────────────────────────────────────────────╮╭─ Now Playing [q: Queue] ─────╮
+│* Home                    ││Featured Albums & Cover Grid                                                  ││                              │
+│  Search                  ││                                                                              ││                              │
+│  Liked Songs             ││                                                                              ││                              │
+│  Podcasts                ││╭─ Command Palette (Ctrl+P) ────────────────────────────────────────────────────╮                             │
+│  Zen Mode                │││> _                                                                            │                             │
+│                          │││                                                                               │                             │
+│[Filter: All]             │││Playback: Toggle Play / Pause  [Space]                                         │                             │
+│* Late Night Rust & Synth…│││Playback: Next Track  [n]                                                      │                             │
+│* Midnight Vinyl Jazz (4) │││Playback: Previous Track  [p]                                                  │                             │
+│  Classic Wax Pressing (5)│││Playback: Toggle Shuffle  [s]                                                  │                             │
+│  Neon & Arpeggi (5)      │││Playback: Cycle Repeat Mode  [r]                                               │                             │
+│  Audiophile Reference (6)│││Connect: Switch Spotify Device  [d]                                            │nstant Crush                 │
+│                          │││View: Toggle Zen Fullscreen Now Playing  [z]                                   │aft Punk, Julian Casablancas │
+│                          │││View: Toggle Queue Panel  [q]                                                  │andom Access Memories        │
+│                          │││Navigate: Home Dashboard                                                       │                             │
+│                          │││Navigate: Instant Search  [/]                                                  │ext in Queue:                │
+│                          │││Navigate: Liked Songs                                                          │iorgio by Moroder — Daft Punk│
+│                          │││Navigate: Podcasts & Episodes                                                  │                             │
+│                          │││Theme: Switch to vynl-dark                                                     │                             │
+│                          │││Theme: Switch to catppuccin-mocha                                              │                             │
+│                          │││Theme: Switch to tokyo-night                                                   │                             │
+│                          │││Theme: Switch to gruvbox                                                       │                             │
+│                          ││╰───────────────────────────────────────────────────────────────────────────────╯                             │
+│                          ││   12 Let It Happen            Tame Impala         ♥ 07:47                    ││                              │
+│                          ││   13 The Less I Know the Bet… Tame Impala        E♥ 03:36                    ││                              │
+╰──────────────────────────╯╰──────────────────────────────────────────────────────────────────────────────╯╰──────────────────────────────╯
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│▀▀▀▀ Instant Crush ♥                                  [S] [|<] [||] [>|] [R:context]                                        Vol  78%      │
+│▀▀▀▀ Daft Punk, Julian Casablan…  01:24 ━━━━━━━━━━━━━●────────────────────────────────────────── 05:37                      vynl (Integ…  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

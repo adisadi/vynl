@@ -7,10 +7,20 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use vynl_core::config::AppConfig;
+#[cfg(all(
+    not(target_os = "freebsd"),
+    any(feature = "rodio-backend", feature = "subprocess-backend")
+))]
+use vynl_core::config::PlaybackMode;
 use vynl_core::keymap::{
     KeyAction, KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind, resolve_hybrid_key,
 };
 use vynl_core::model::{ToastLevel, TrackSummary};
+#[cfg(all(
+    not(target_os = "freebsd"),
+    any(feature = "rodio-backend", feature = "subprocess-backend")
+))]
+use vynl_core::state::AppCommand;
 use vynl_core::state::{ActiveModal, AppEvent, AppState, PanelFocus, Route, reduce};
 use vynl_core::theme::Theme;
 use vynl_images::{
@@ -18,6 +28,13 @@ use vynl_images::{
     L1ImageCache, L2DiskCache, OcclusionTracker, generate_demo_cover,
 };
 use vynl_player::PlaybackEngine;
+#[cfg(all(
+    not(target_os = "freebsd"),
+    any(feature = "rodio-backend", feature = "subprocess-backend")
+))]
+use vynl_player::{
+    IntegratedCommand, IntegratedEvent, IntegratedPlayerConfig, IntegratedPlayerHandle,
+};
 use vynl_spotify::demo::DemoCatalog;
 use vynl_spotify::search::search_library;
 use vynl_system::ipc::{IpcCommand, IpcResponse, IpcServer, StatusSnapshot};
@@ -49,6 +66,8 @@ pub struct VynlApp {
     pub protocol: ImageProtocol,
     /// L1 RAM LRU cache for encoded terminal images and palettes.
     pub l1_cache: L1ImageCache,
+    /// Shared L2 disk image cache (also used to export PNG icons for OS notifications).
+    disk_cache: Option<Arc<L2DiskCache>>,
     /// Per-frame Modal-Aware Image Occlusion tracker.
     pub occlusion: OcclusionTracker,
     /// Offline demo catalog (used in `--demo` and headless snapshot tests).
@@ -59,6 +78,12 @@ pub struct VynlApp {
     pub persist_config: bool,
     /// Dual playback engine & stream cache coordinator.
     pub player: Option<PlaybackEngine>,
+    /// Integrated `librespot` player handle when compiled and configured in integrated mode.
+    #[cfg(all(
+        not(target_os = "freebsd"),
+        any(feature = "rodio-backend", feature = "subprocess-backend")
+    ))]
+    integrated_player: Option<IntegratedPlayerHandle>,
     /// Live local OS media control bridge (`souvlaki` MPRIS2/SMTC/MediaRemote with fallback).
     pub media_bridge: SystemMediaBridge,
     /// Inbound OS media-key event receiver.
@@ -71,6 +96,10 @@ pub struct VynlApp {
     spotify_worker: Option<SpotifyWorkerHandle>,
     /// Cached playlist tracks loaded from Spotify / `redb`, keyed by playlist ID.
     playlist_tracks: BTreeMap<String, Vec<TrackSummary>>,
+    /// Cached album tracks loaded from Spotify, keyed by album ID.
+    album_tracks: BTreeMap<String, Vec<TrackSummary>>,
+    /// Cached artist top tracks loaded from Spotify, keyed by artist ID.
+    artist_tracks: BTreeMap<String, Vec<TrackSummary>>,
     /// Known playlist snapshot IDs for `If-None-Match` cache validation.
     playlist_snapshots: BTreeMap<String, String>,
     /// Optional background HTTP cover fetcher & JPEG/PNG/WebP decoder worker.
@@ -109,7 +138,8 @@ impl VynlApp {
 
     /// Creates a live `vynl` application backed by disk `config.toml`, custom themes,
     /// OS-keyring OAuth tokens, `HttpImageSource` cover art worker, `souvlaki` media
-    /// controls, and the background `SpotifyApiClient` + `redb` worker.
+    /// controls, optional integrated `librespot` playback, and the background
+    /// `SpotifyApiClient` + `redb` worker.
     #[must_use]
     pub fn new_live(config: AppConfig, paths: AppPaths, protocol: ImageProtocol) -> Self {
         let custom_themes = storage::discover_custom_themes(&paths);
@@ -123,12 +153,13 @@ impl VynlApp {
             SystemMediaBridge::in_memory()
         };
 
-        let image_worker = spawn_http_image_worker(&config, &paths);
+        let (image_worker, disk_cache) = spawn_http_image_worker(&config, &paths);
         let l1_cap = config.images.max_memory_cache_items;
         let notif_enabled = config.integrations.notifications;
 
         let mut app = Self {
             l1_cache: L1ImageCache::new(l1_cap),
+            disk_cache,
             occlusion: OcclusionTracker::new(),
             active_theme: base_theme.clone(),
             base_theme,
@@ -139,6 +170,11 @@ impl VynlApp {
             demo_mode: false,
             persist_config: true,
             player,
+            #[cfg(all(
+                not(target_os = "freebsd"),
+                any(feature = "rodio-backend", feature = "subprocess-backend")
+            ))]
+            integrated_player: None,
             media_bridge,
             media_rx,
             notifier: LocalOsNotifier::new().with_enabled(notif_enabled),
@@ -146,6 +182,8 @@ impl VynlApp {
             config,
             spotify_worker: None,
             playlist_tracks: BTreeMap::new(),
+            album_tracks: BTreeMap::new(),
+            artist_tracks: BTreeMap::new(),
             playlist_snapshots: BTreeMap::new(),
             image_worker,
             pending_images: HashSet::new(),
@@ -207,6 +245,7 @@ impl VynlApp {
 
         let mut app = Self {
             l1_cache: L1ImageCache::new(l1_cap),
+            disk_cache: None,
             occlusion: OcclusionTracker::new(),
             active_theme: base_theme.clone(),
             base_theme,
@@ -217,6 +256,11 @@ impl VynlApp {
             demo_mode: true,
             persist_config,
             player,
+            #[cfg(all(
+                not(target_os = "freebsd"),
+                any(feature = "rodio-backend", feature = "subprocess-backend")
+            ))]
+            integrated_player: None,
             media_bridge,
             media_rx,
             notifier: LocalOsNotifier::new().with_enabled(notif_enabled),
@@ -224,6 +268,8 @@ impl VynlApp {
             config,
             spotify_worker: None,
             playlist_tracks: BTreeMap::new(),
+            album_tracks: BTreeMap::new(),
+            artist_tracks: BTreeMap::new(),
             playlist_snapshots: BTreeMap::new(),
             image_worker: None,
             pending_images: HashSet::new(),
@@ -253,6 +299,23 @@ impl VynlApp {
 
         match storage::load_tokens(&self.paths) {
             Ok(Some(tokens)) => {
+                #[cfg(all(
+                    not(target_os = "freebsd"),
+                    any(feature = "rodio-backend", feature = "subprocess-backend")
+                ))]
+                if self.config.spotify.playback_mode == PlaybackMode::Integrated {
+                    let player_cfg = IntegratedPlayerConfig::from_spotify_config(
+                        &self.config.spotify,
+                        self.paths.audio_cache_dir.clone(),
+                    );
+                    if let Ok(handle) = IntegratedPlayerHandle::spawn_with_access_token(
+                        player_cfg,
+                        tokens.access_token.clone(),
+                    ) {
+                        self.integrated_player = Some(handle);
+                    }
+                }
+
                 match SpotifyWorkerHandle::spawn_live(&self.paths, client_id, tokens) {
                     Ok(worker) => {
                         worker.send(BackendRequest::Bootstrap);
@@ -284,11 +347,56 @@ impl VynlApp {
     }
 
     /// Central Elm reducer dispatcher: updates [`AppState`] and forwards every emitted
-    /// [`vynl_core::state::AppCommand`] to the background Spotify worker when connected.
+    /// [`vynl_core::state::AppCommand`] to the integrated player and/or background
+    /// Spotify Web API worker when connected.
     fn dispatch(&mut self, event: AppEvent) {
         let commands = reduce(&mut self.state, event);
-        if let Some(ref worker) = self.spotify_worker {
-            for cmd in commands {
+        for cmd in commands {
+            #[cfg(all(
+                not(target_os = "freebsd"),
+                any(feature = "rodio-backend", feature = "subprocess-backend")
+            ))]
+            if let Some(ref integrated) = self.integrated_player {
+                let handled_locally = match &cmd {
+                    AppCommand::PlayTrackId(track_id) => {
+                        let uri = if track_id.starts_with("spotify:") {
+                            track_id.clone()
+                        } else {
+                            format!("spotify:track:{track_id}")
+                        };
+                        let _ = integrated.send(IntegratedCommand::LoadTrack {
+                            spotify_uri: uri,
+                            start_playing: true,
+                            position_ms: 0,
+                        });
+                        true
+                    }
+                    AppCommand::SetPlaying(true) => {
+                        let _ = integrated.send(IntegratedCommand::Play);
+                        true
+                    }
+                    AppCommand::SetPlaying(false) => {
+                        let _ = integrated.send(IntegratedCommand::Pause);
+                        true
+                    }
+                    AppCommand::SeekMs(ms) => {
+                        let _ = integrated.send(IntegratedCommand::Seek(
+                            u32::try_from(*ms).unwrap_or(u32::MAX),
+                        ));
+                        true
+                    }
+                    AppCommand::SetVolume(vol) => {
+                        let _ = integrated.send(IntegratedCommand::SetVolume(*vol));
+                        true
+                    }
+                    _ => false,
+                };
+                if handled_locally {
+                    continue;
+                }
+            }
+
+            if let Some(ref worker) = self.spotify_worker {
                 worker.send(BackendRequest::Command(cmd));
             }
         }
@@ -308,43 +416,53 @@ impl VynlApp {
                     Vec::new()
                 }
             }
-            Route::Album(id) => self
-                .state
-                .library
-                .albums
-                .iter()
-                .find(|a| a.id == *id)
-                .map_or_else(Vec::new, |a| {
-                    if self.demo_mode {
-                        self.demo.tracks_for_album(&a.title)
-                    } else {
-                        self.state
-                            .library
-                            .liked_tracks
-                            .iter()
-                            .filter(|t| t.album == a.title)
-                            .cloned()
-                            .collect()
-                    }
-                }),
-            Route::Artist(id) => self
-                .state
-                .library
-                .artists
-                .iter()
-                .find(|a| a.id == *id)
-                .map_or_else(Vec::new, |artist| {
-                    let source = if self.demo_mode {
-                        &self.demo.tracks
-                    } else {
-                        &self.state.library.liked_tracks
-                    };
-                    source
+            Route::Album(id) => {
+                if let Some(tracks) = self.album_tracks.get(id) {
+                    tracks.clone()
+                } else {
+                    self.state
+                        .library
+                        .albums
                         .iter()
-                        .filter(|t| t.artists.iter().any(|n| n == &artist.name))
-                        .cloned()
-                        .collect()
-                }),
+                        .find(|a| a.id == *id)
+                        .map_or_else(Vec::new, |a| {
+                            if self.demo_mode {
+                                self.demo.tracks_for_album(&a.title)
+                            } else {
+                                self.state
+                                    .library
+                                    .liked_tracks
+                                    .iter()
+                                    .filter(|t| t.album == a.title)
+                                    .cloned()
+                                    .collect()
+                            }
+                        })
+                }
+            }
+            Route::Artist(id) => {
+                if let Some(tracks) = self.artist_tracks.get(id) {
+                    tracks.clone()
+                } else {
+                    self.state
+                        .library
+                        .artists
+                        .iter()
+                        .find(|a| a.id == *id)
+                        .map_or_else(Vec::new, |artist| {
+                            let source = if self.demo_mode {
+                                &self.demo.tracks
+                            } else {
+                                &self.state.library.liked_tracks
+                            };
+                            source
+                                .iter()
+                                .filter(|t| t.artists.iter().any(|n| n == &artist.name))
+                                .cloned()
+                                .collect()
+                        })
+                }
+            }
             Route::Search => self.state.search_results.tracks.clone(),
             Route::Podcasts | Route::ZenNowPlaying => Vec::new(),
         };
@@ -384,8 +502,8 @@ impl VynlApp {
         render_frame(cols, rows, &mut ctx)
     }
 
-    /// Drains completed background image decodes, Spotify Web API updates, and OS media
-    /// control events without blocking the UI thread.
+    /// Drains completed background image decodes, Spotify Web API updates, integrated
+    /// player events, and OS media control events without blocking the UI thread.
     pub fn poll_background_workers(&mut self) {
         // 1. Drain completed remote cover decodes from ImageWorker into L1 cache.
         if let Some(ref worker) = self.image_worker {
@@ -424,13 +542,75 @@ impl VynlApp {
             self.apply_backend_update(update);
         }
 
-        // 3. Drain inbound OS media-key events (MPRIS2 / SMTC / MediaRemote).
+        // 3. Drain event-driven updates from the integrated librespot playback engine.
+        #[cfg(all(
+            not(target_os = "freebsd"),
+            any(feature = "rodio-backend", feature = "subprocess-backend")
+        ))]
+        {
+            let mut integrated_events = Vec::new();
+            if let Some(ref integrated) = self.integrated_player {
+                while let Some(ev) = integrated.try_recv_event() {
+                    integrated_events.push(ev);
+                }
+            }
+            for ev in integrated_events {
+                self.apply_integrated_event(ev);
+            }
+        }
+
+        // 4. Drain inbound OS media-key events (MPRIS2 / SMTC / MediaRemote).
         let mut media_events = Vec::new();
         while let Ok(ev) = self.media_rx.try_recv() {
             media_events.push(ev);
         }
         for ev in media_events {
             self.handle_media_control_event(ev);
+        }
+    }
+
+    #[cfg(all(
+        not(target_os = "freebsd"),
+        any(feature = "rodio-backend", feature = "subprocess-backend")
+    ))]
+    fn apply_integrated_event(&mut self, event: IntegratedEvent) {
+        match event {
+            IntegratedEvent::Connected { device_name } => {
+                self.state.playback.active_device = Some(vynl_core::model::ConnectDevice {
+                    id: String::from("vynl-integrated"),
+                    name: device_name.clone(),
+                    device_type: String::from("Computer"),
+                    is_active: true,
+                    volume_percent: self.state.playback.volume_percent,
+                });
+                self.dispatch(AppEvent::ShowToast {
+                    level: ToastLevel::Info,
+                    text: format!("Integrated Spotify Connect active: {device_name}"),
+                });
+            }
+            IntegratedEvent::Playing { position_ms, .. } => {
+                self.state.playback.is_playing = true;
+                self.state.playback.position_ms = u64::from(position_ms);
+                self.sync_os_bridges(false);
+            }
+            IntegratedEvent::Paused { position_ms, .. } => {
+                self.state.playback.is_playing = false;
+                self.state.playback.position_ms = u64::from(position_ms);
+                self.sync_os_bridges(false);
+            }
+            IntegratedEvent::Stopped => {
+                self.state.playback.is_playing = false;
+                self.sync_os_bridges(false);
+            }
+            IntegratedEvent::TrackEnded { .. } => {
+                self.execute_key_action(KeyAction::NextTrack);
+            }
+            IntegratedEvent::Error(msg) => {
+                self.dispatch(AppEvent::ShowToast {
+                    level: ToastLevel::Warning,
+                    text: format!("Integrated player: {msg}"),
+                });
+            }
         }
     }
 
@@ -488,6 +668,14 @@ impl VynlApp {
                 self.playlist_snapshots
                     .insert(playlist_id.clone(), snapshot_id);
                 self.playlist_tracks.insert(playlist_id, tracks);
+                self.clamp_selections();
+            }
+            BackendUpdate::AlbumTracksLoaded { album_id, tracks } => {
+                self.album_tracks.insert(album_id, tracks);
+                self.clamp_selections();
+            }
+            BackendUpdate::ArtistTracksLoaded { artist_id, tracks } => {
+                self.artist_tracks.insert(artist_id, tracks);
                 self.clamp_selections();
             }
             BackendUpdate::SearchResultsLoaded(results) => {
@@ -679,14 +867,11 @@ impl VynlApp {
                         });
                     }
                     KeyCode::Enter => {
-                        if let Some(pl) = self.state.library.playlists.get_mut(selected) {
-                            let added = u32::try_from(track_ids.len()).unwrap_or(1);
-                            pl.track_count = pl.track_count.saturating_add(added);
-                            let name = pl.name.clone();
-                            self.state.modal = None;
-                            self.dispatch(AppEvent::ShowToast {
-                                level: ToastLevel::Info,
-                                text: format!("Added {added} track(s) to {name}"),
+                        if let Some(pl) = self.state.library.playlists.get(selected) {
+                            let playlist_id = pl.id.clone();
+                            self.dispatch(AppEvent::AddTracksToPlaylist {
+                                playlist_id,
+                                track_ids,
                             });
                         }
                     }
@@ -1193,19 +1378,46 @@ impl VynlApp {
             }
         }
 
-        if self.state.playback.is_playing {
-            #[expect(clippy::cast_precision_loss)]
-            let phase = (self.tick_counter as f32) * 0.35;
-            for (i, bar) in self.spectrum_bars.iter_mut().enumerate() {
+        // Feed real-time FFT spectrum bars from the integrated librespot player when
+        // the `visualizer` feature is compiled and active; fall back to smooth animation.
+        if !self.poll_live_spectrum() {
+            if self.state.playback.is_playing {
                 #[expect(clippy::cast_precision_loss)]
-                let freq = (i as f32) * 0.55 + phase;
-                *bar = (freq.sin().abs() * 0.75 + 0.15).clamp(0.0, 1.0);
-            }
-        } else {
-            for bar in &mut self.spectrum_bars {
-                *bar *= 0.6;
+                let phase = (self.tick_counter as f32) * 0.35;
+                for (i, bar) in self.spectrum_bars.iter_mut().enumerate() {
+                    #[expect(clippy::cast_precision_loss)]
+                    let freq = (i as f32) * 0.55 + phase;
+                    *bar = (freq.sin().abs() * 0.75 + 0.15).clamp(0.0, 1.0);
+                }
+            } else {
+                for bar in &mut self.spectrum_bars {
+                    *bar *= 0.6;
+                }
             }
         }
+    }
+
+    #[cfg(all(
+        not(target_os = "freebsd"),
+        any(feature = "rodio-backend", feature = "subprocess-backend")
+    ))]
+    fn poll_live_spectrum(&mut self) -> bool {
+        if let Some(ref integrated) = self.integrated_player {
+            let live_bars = integrated.spectrum_bars();
+            if !live_bars.is_empty() {
+                self.spectrum_bars = live_bars;
+                return true;
+            }
+        }
+        false
+    }
+
+    #[cfg(not(all(
+        not(target_os = "freebsd"),
+        any(feature = "rodio-backend", feature = "subprocess-backend")
+    )))]
+    const fn poll_live_spectrum(&self) -> bool {
+        false
     }
 
     /// Extracts dominant colors from the active track cover and applies WCAG-AA accent.
@@ -1237,7 +1449,15 @@ impl VynlApp {
             && self.config.integrations.notifications
             && let Some(ref track) = self.state.playback.current_track
         {
-            let payload = NotificationPayload::from_track(track, None);
+            let icon_path = track.cover.as_ref().and_then(|cover| {
+                let cache = self.disk_cache.as_ref()?;
+                let dest = self.paths.image_cache_dir.join("notify-cover.png");
+                cache
+                    .export_png(&cover.url, &dest)
+                    .ok()
+                    .and_then(|exported| exported.then_some(dest))
+            });
+            let payload = NotificationPayload::from_track(track, icon_path);
             let _ = self.notifier.notify(&payload);
         }
     }
@@ -1354,16 +1574,23 @@ impl VynlApp {
     }
 }
 
-fn spawn_http_image_worker(config: &AppConfig, paths: &AppPaths) -> Option<ImageWorker> {
+fn spawn_http_image_worker(
+    config: &AppConfig,
+    paths: &AppPaths,
+) -> (Option<ImageWorker>, Option<Arc<L2DiskCache>>) {
     if !config.images.enabled {
-        return None;
+        return (None, None);
     }
-    let source: Arc<dyn ImageSource> = Arc::new(HttpImageSource::new().ok()?);
+    let Ok(http_source) = HttpImageSource::new() else {
+        return (None, None);
+    };
+    let source: Arc<dyn ImageSource> = Arc::new(http_source);
     let max_bytes = u64::from(config.images.max_disk_cache_mb).saturating_mul(1024 * 1024);
     let disk_cache = L2DiskCache::new(paths.image_cache_dir.clone(), max_bytes)
         .ok()
         .map(Arc::new);
-    ImageWorker::spawn(2, &source, disk_cache.as_ref()).ok()
+    let worker = ImageWorker::spawn(2, &source, disk_cache.as_ref()).ok();
+    (worker, disk_cache)
 }
 
 #[cfg(test)]
@@ -1525,11 +1752,15 @@ border = "#242844"
 
         // Attach a mock-backed SpotifyWorkerHandle and verify AppCommand dispatch
         let transport = MockSpotifyTransport::new();
+        // me, liked_tracks, playlists, saved_albums, followed_artists, saved_episodes, recently_played, playback, devices, next_track
         transport.push_json(
             200,
             r#"{"id":"u42","display_name":"Grace","product":"premium"}"#,
         );
         transport.push_json(200, r#"{"items":[]}"#);
+        transport.push_json(200, r#"{"items":[]}"#);
+        transport.push_json(200, r#"{"items":[]}"#);
+        transport.push_json(200, r#"{"artists":{"items":[]}}"#);
         transport.push_json(200, r#"{"items":[]}"#);
         transport.push_json(200, r#"{"items":[]}"#);
         transport.push_response(HttpResponse::new(204, ""));

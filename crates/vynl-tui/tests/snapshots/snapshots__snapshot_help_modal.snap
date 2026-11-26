@@ -1,0 +1,38 @@
+---
+source: crates/vynl-tui/tests/snapshots.rs
+expression: frame.to_plain_text()
+---
+╭─ vynl ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│[<]         / Search songs, artists, albums... (Ctrl+P Palette)                                                 Vinyl Explorer [?]        │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ Library ────────────────╮╭─ Home ───────────────────────────────────────────────────────────────────────╮╭─ Now Playing [q: Queue] ─────╮
+│* Home                    ││Featured Albums & Cover Grid                                                  ││                              │
+│  Search             ╭─ vynl Help — Hybrid Keybindings & Mouse (?) ────────────────────────────────────────────────╮                      │
+│  Liked Songs        │Arrows / h j k l    Navigate panels & lists (g/G top/bottom)                                 │                      │
+│  Podcasts           │Tab / Shift+Tab     Cycle focus between Sidebar, Main & Queue                                │                      │
+│  Zen Mode           │Enter / Click       Play track or open selected view                                         │                      │
+│                     │Space               Play / Pause                                                             │                      │
+│[Filter: All]        │n / p  (or > / <)   Next / Previous track                                                    │                      │
+│* Late Night Rust & S│Shift+Left / Right  Seek -5s / +5s (or click Progress Bar)                                   │                      │
+│* Midnight Vinyl Jazz│+ / - / m           Volume +/-5% / Mute (or click Volume Bar)                                │                      │
+│  Classic Wax Pressin│s / r               Toggle Shuffle / Cycle Repeat                                            │                      │
+│  Neon & Arpeggi (5) │L / a / P / x       Like / Queue / Add to Playlist / Multi-Select                            │                      │
+│  Audiophile Referenc│/ or Ctrl+F         Instant Search (f for inline list filter)                                │Crush                 │
+│                     │Ctrl+P or :         Command Palette (themes, navigation, controls)                           │k, Julian Casablancas │
+│                     │d / q / z           Device Picker / Queue Panel / Zen Cover Mode                             │ccess Memories        │
+│                     │Esc / Q / Ctrl+C    Dismiss modal / Quit cleanly                                             │                      │
+│                     │                                                                                             │Queue:                │
+│                     │                                                                                             │by Moroder — Daft Punk│
+│                     │                                                                                             │                      │
+│                     │                                                                                             │                      │
+│                     │                                                                                             │                      │
+│                     │                                                                                             │                      │
+│                     │                                                                                             │                      │
+│                     │                                                                                             │                      │
+│                     │                                                                                             │                      │
+│                     ╰─────────────────────────────────────────────────────────────────────────────────────────────╯                      │
+╰──────────────────────────╯╰──────────────────────────────────────────────────────────────────────────────╯╰──────────────────────────────╯
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│▀▀▀▀ Instant Crush ♥                                  [S] [|<] [||] [>|] [R:context]                                        Vol  78%      │
+│▀▀▀▀ Daft Punk, Julian Casablan…  01:24 ━━━━━━━━━━━━━●────────────────────────────────────────── 05:37                      vynl (Integ…  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

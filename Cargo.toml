@@ -38,6 +38,8 @@ librespot-core = { version = "0.8", default-features = false, features = ["rustl
 librespot-playback = { version = "0.8", default-features = false, features = ["rustls-tls-webpki-roots"] }
 librespot-connect = { version = "0.8", default-features = false, features = ["rustls-tls-webpki-roots"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+notify-rust = { version = "4", default-features = false, features = ["z"] }
+insta = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

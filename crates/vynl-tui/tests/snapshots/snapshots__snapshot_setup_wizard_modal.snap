@@ -1,0 +1,38 @@
+---
+source: crates/vynl-tui/tests/snapshots.rs
+expression: frame.to_plain_text()
+---
+╭─ vynl ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│[<]         / Search songs, artists, albums... (Ctrl+P Palette)                                                 Vinyl Explorer [?]        │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ Library ────────────────╮╭─ Home ───────────────────────────────────────────────────────────────────────╮╭─ Now Playing [q: Queue] ─────╮
+│* Home                    ││Featured Albums & Cover Grid                                                  ││                              │
+│  Search                  ││                                                                              ││                              │
+│  Liked Songs             ││                                                                              ││                              │
+│  Podcasts                ││                                                                              ││                              │
+│  Zen Mode              ╭─ Spotify Setup Wizard (BYO Client ID) ────────────────────────────────────────────────╮                         │
+│                        │vynl uses OAuth 2.0 PKCE with your own Spotify Developer Client ID.                    │                         │
+│[Filter: All]           │1. Create an app at developer.spotify.com/dashboard                                    │                         │
+│* Late Night Rust & Synt│2. Add Redirect URI: http://127.0.0.1:8888/callback                                    │                         │
+│* Midnight Vinyl Jazz (4│3. Paste your Client ID below and press Enter (or Esc for Demo):                       │                         │
+│  Classic Wax Pressing (│                                                                                       │                         │
+│  Neon & Arpeggi (5)    │Client ID: demo-client-id_                                                             │                         │
+│  Audiophile Reference (│                                                                                       │nt Crush                 │
+│                        │                                                                                       │Punk, Julian Casablancas │
+│                        │                                                                                       │m Access Memories        │
+│                        │                                                                                       │                         │
+│                        │                                                                                       │in Queue:                │
+│                        │                                                                                       │io by Moroder — Daft Punk│
+│                        │                                                                                       │                         │
+│                        │                                                                                       │                         │
+│                        │                                                                                       │                         │
+│                        ╰───────────────────────────────────────────────────────────────────────────────────────╯                         │
+│                          ││   10 Dreams                   Fleetwood Mac       ♥ 04:17                    ││                              │
+│                          ││   11 The Chain                Fleetwood Mac       ♥ 04:30                    ││                              │
+│                          ││   12 Let It Happen            Tame Impala         ♥ 07:47                    ││                              │
+│                          ││   13 The Less I Know the Bet… Tame Impala        E♥ 03:36                    ││                              │
+╰──────────────────────────╯╰──────────────────────────────────────────────────────────────────────────────╯╰──────────────────────────────╯
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│▀▀▀▀ Instant Crush ♥                                  [S] [|<] [||] [>|] [R:context]                                        Vol  78%      │
+│▀▀▀▀ Daft Punk, Julian Casablan…  01:24 ━━━━━━━━━━━━━●────────────────────────────────────────── 05:37                      vynl (Integ…  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

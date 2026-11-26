@@ -7,6 +7,8 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "visualizer")]
+use std::sync::Mutex;
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::thread::{self, JoinHandle};
 
@@ -31,6 +33,12 @@ use crate::error::PlayerError;
 use crate::sink::{AudioFormat, AudioSink, NullAudioSink};
 use crate::stream_cache::BYTES_PER_MIB;
 use crate::sync::resolve_backend;
+#[cfg(feature = "visualizer")]
+use crate::visualizer::SpectrumAnalyzer;
+
+/// Number of logarithmic FFT spectrum bands matching Zen mode's visualizer.
+#[cfg(feature = "visualizer")]
+const ZEN_SPECTRUM_BANDS: usize = 16;
 
 /// Configuration for the integrated `librespot` player and Spotify Connect device.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,6 +286,8 @@ pub struct IntegratedPlayerHandle {
     cmd_tx: tokio_mpsc::UnboundedSender<IntegratedCommand>,
     event_rx: std_mpsc::Receiver<IntegratedEvent>,
     worker: Option<JoinHandle<()>>,
+    #[cfg(feature = "visualizer")]
+    spectrum: Arc<Mutex<SpectrumAnalyzer>>,
 }
 
 impl IntegratedPlayerHandle {
@@ -308,6 +318,16 @@ impl IntegratedPlayerHandle {
         let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<IntegratedCommand>();
         let (event_tx, event_rx) = std_mpsc::channel::<IntegratedEvent>();
 
+        #[cfg(feature = "visualizer")]
+        let spectrum = Arc::new(Mutex::new(SpectrumAnalyzer::new(
+            SpectrumAnalyzer::DEFAULT_FFT_SIZE,
+            ZEN_SPECTRUM_BANDS,
+            AudioFormat::CD_STEREO.sample_rate,
+            AudioFormat::CD_STEREO.channels,
+        )?));
+        #[cfg(feature = "visualizer")]
+        let spectrum_worker = Arc::clone(&spectrum);
+
         let worker = thread::Builder::new()
             .name(String::from("vynl-librespot-main"))
             .spawn(move || {
@@ -317,6 +337,8 @@ impl IntegratedPlayerHandle {
                     cache,
                     cmd_rx,
                     event_tx,
+                    #[cfg(feature = "visualizer")]
+                    spectrum_worker,
                 ));
             })?;
 
@@ -324,6 +346,8 @@ impl IntegratedPlayerHandle {
             cmd_tx,
             event_rx,
             worker: Some(worker),
+            #[cfg(feature = "visualizer")]
+            spectrum,
         })
     }
 
@@ -343,6 +367,26 @@ impl IntegratedPlayerHandle {
         self.event_rx.try_recv().ok()
     }
 
+    /// Returns the latest normalized FFT spectrum bars (`0.0..=1.0`) from the decoded PCM tap.
+    ///
+    /// Returns an empty vector when built without the `visualizer` feature or if the
+    /// analyzer lock is unavailable.
+    #[must_use]
+    #[cfg_attr(not(feature = "visualizer"), allow(clippy::unused_self))]
+    pub fn spectrum_bars(&self) -> Vec<f32> {
+        #[cfg(feature = "visualizer")]
+        {
+            self.spectrum
+                .lock()
+                .map(|analyzer| analyzer.bars().to_vec())
+                .unwrap_or_default()
+        }
+        #[cfg(not(feature = "visualizer"))]
+        {
+            Vec::new()
+        }
+    }
+
     /// Sends [`IntegratedCommand::Shutdown`] and waits for the background runtime thread to exit.
     pub fn shutdown(mut self) {
         let _ = self.cmd_tx.send(IntegratedCommand::Shutdown);
@@ -358,12 +402,22 @@ impl Drop for IntegratedPlayerHandle {
     }
 }
 
+#[cfg(feature = "visualizer")]
+fn build_spectrum_tap(analyzer: Arc<Mutex<SpectrumAnalyzer>>) -> PcmTapCallback {
+    Box::new(move |pcm| {
+        if let Ok(mut guard) = analyzer.try_lock() {
+            guard.push_interleaved_pcm(pcm);
+        }
+    })
+}
+
 async fn run_integrated_session(
     config: IntegratedPlayerConfig,
     access_token: String,
     cache: Option<Cache>,
     mut cmd_rx: tokio_mpsc::UnboundedReceiver<IntegratedCommand>,
     event_tx: std_mpsc::Sender<IntegratedEvent>,
+    #[cfg(feature = "visualizer")] spectrum: Arc<Mutex<SpectrumAnalyzer>>,
 ) {
     let session_config = config.to_session_config();
     let player_config = config.to_player_config();
@@ -388,7 +442,12 @@ async fn run_integrated_session(
         player_config,
         session.clone(),
         mixer.get_soft_volume(),
-        move || Box::new(VynlLibrespotSink::new(build_audio_sink(backend))),
+        move || {
+            let sink = VynlLibrespotSink::new(build_audio_sink(backend));
+            #[cfg(feature = "visualizer")]
+            let sink = sink.with_pcm_tap(build_spectrum_tap(Arc::clone(&spectrum)));
+            Box::new(sink)
+        },
     );
 
     let mut player_events = player.get_player_event_channel();
@@ -749,5 +808,62 @@ mod tests {
             IntegratedPlayerHandle::spawn_with_access_token(cfg, String::from("   ")),
             Err(PlayerError::InvalidState(_))
         ));
+    }
+
+    #[cfg(feature = "visualizer")]
+    #[test]
+    fn pcm_tap_feeds_440hz_sine_into_spectrum_analyzer() -> Result<(), String> {
+        use std::f64::consts::PI;
+        use std::sync::{Arc, Mutex};
+
+        use super::{ZEN_SPECTRUM_BANDS, build_spectrum_tap};
+        use crate::visualizer::SpectrumAnalyzer;
+
+        let format = AudioFormat::CD_STEREO;
+        let fft_size = SpectrumAnalyzer::DEFAULT_FFT_SIZE;
+        let analyzer = Arc::new(Mutex::new(
+            SpectrumAnalyzer::new(
+                fft_size,
+                ZEN_SPECTRUM_BANDS,
+                format.sample_rate,
+                format.channels,
+            )
+            .map_err(|err| err.to_string())?,
+        ));
+
+        let mut sink = VynlLibrespotSink::new(Box::new(NullAudioSink::new(format)))
+            .with_pcm_tap(build_spectrum_tap(Arc::clone(&analyzer)));
+
+        let mut stereo_samples = Vec::with_capacity(fft_size * usize::from(format.channels));
+        for frame in 0..fft_size {
+            #[allow(clippy::cast_precision_loss)]
+            let t = (frame as f64) / f64::from(format.sample_rate);
+            let value = (2.0 * PI * 440.0 * t).sin() * 0.85;
+            stereo_samples.push(value);
+            stereo_samples.push(value);
+        }
+
+        let mut converter = Converter::new(None);
+        sink.start().map_err(|err| err.to_string())?;
+        sink.write(AudioPacket::Samples(stereo_samples), &mut converter)
+            .map_err(|err| err.to_string())?;
+        sink.stop().map_err(|err| err.to_string())?;
+
+        let guard = analyzer.lock().map_err(|err| err.to_string())?;
+        let bars = guard.bars();
+        assert_eq!(bars.len(), ZEN_SPECTRUM_BANDS);
+        assert!(bars.iter().all(|&bar| (0.0..=1.0).contains(&bar)));
+        assert!(
+            bars.iter().any(|&bar| bar > 0.5),
+            "expected non-zero spectrum bar from 440 Hz sine wave, got {bars:?}"
+        );
+
+        let bin_width_hz = f64::from(format.sample_rate) / 1024.0;
+        let peak_hz = guard.peak_frequency_hz();
+        assert!(
+            (peak_hz - 440.0).abs() <= bin_width_hz,
+            "expected peak near 440 Hz, got {peak_hz} Hz"
+        );
+        Ok(())
     }
 }

@@ -38,6 +38,16 @@ pub enum BackendRequest {
         /// Last known snapshot ID (for `If-None-Match` short-circuiting).
         cached_snapshot_id: Option<String>,
     },
+    /// Fetch tracks belonging to a specific Spotify album.
+    FetchAlbumTracks {
+        /// Spotify album ID.
+        album_id: String,
+    },
+    /// Fetch top tracks for a specific Spotify artist.
+    FetchArtistTopTracks {
+        /// Spotify artist ID.
+        artist_id: String,
+    },
     /// Poll active playback state and Connect devices (adaptive remote sync).
     PollPlayback,
     /// Gracefully terminate the worker thread.
@@ -70,6 +80,20 @@ pub enum BackendUpdate {
         playlist_id: String,
         /// Snapshot ID returned by Spotify.
         snapshot_id: String,
+        /// Ordered track summaries.
+        tracks: Vec<TrackSummary>,
+    },
+    /// Tracks loaded for a specific album.
+    AlbumTracksLoaded {
+        /// Spotify album ID.
+        album_id: String,
+        /// Ordered track summaries.
+        tracks: Vec<TrackSummary>,
+    },
+    /// Top tracks loaded for a specific artist.
+    ArtistTracksLoaded {
+        /// Spotify artist ID.
+        artist_id: String,
         /// Ordered track summaries.
         tracks: Vec<TrackSummary>,
     },
@@ -215,6 +239,12 @@ impl<T: HttpTransport> WorkerContext<T> {
                     playlist_id,
                     cached_snapshot_id,
                 } => self.handle_fetch_playlist_tracks(&playlist_id, cached_snapshot_id.as_deref()),
+                BackendRequest::FetchAlbumTracks { album_id } => {
+                    self.handle_fetch_album_tracks(&album_id);
+                }
+                BackendRequest::FetchArtistTopTracks { artist_id } => {
+                    self.handle_fetch_artist_top_tracks(&artist_id);
+                }
                 BackendRequest::PollPlayback => self.handle_poll_playback(),
             }
         }
@@ -261,6 +291,7 @@ impl<T: HttpTransport> WorkerContext<T> {
         }
     }
 
+    #[expect(clippy::too_many_lines)]
     fn handle_bootstrap(&mut self) {
         // 1. Emit cached metadata immediately from redb for instant startup.
         if let Some(ref cache) = self.cache
@@ -305,6 +336,30 @@ impl<T: HttpTransport> WorkerContext<T> {
             }
         };
 
+        let albums = match self.call_with_refresh(SpotifyApiClient::saved_albums) {
+            Ok(albums) => albums,
+            Err(err) => {
+                self.report_error("saved albums", &err);
+                Vec::new()
+            }
+        };
+
+        let artists = match self.call_with_refresh(SpotifyApiClient::followed_artists) {
+            Ok(artists) => artists,
+            Err(err) => {
+                self.report_error("followed artists", &err);
+                Vec::new()
+            }
+        };
+
+        let episodes = match self.call_with_refresh(SpotifyApiClient::saved_episodes) {
+            Ok(episodes) => episodes,
+            Err(err) => {
+                self.report_error("saved episodes", &err);
+                Vec::new()
+            }
+        };
+
         let recently_played = match self.call_with_refresh(SpotifyApiClient::recently_played) {
             Ok(recent) => recent,
             Err(err) => {
@@ -327,7 +382,9 @@ impl<T: HttpTransport> WorkerContext<T> {
         let library = LibraryState {
             liked_tracks,
             playlists,
-            ..LibraryState::default()
+            albums,
+            artists,
+            episodes,
         };
 
         let metadata = CachedMetadata {
@@ -418,14 +475,34 @@ impl<T: HttpTransport> WorkerContext<T> {
         }
     }
 
+    fn handle_fetch_album_tracks(&mut self, album_id: &str) {
+        match self.call_with_refresh(|client| client.album_tracks(album_id)) {
+            Ok(tracks) => {
+                let _ = self.upd_tx.send(BackendUpdate::AlbumTracksLoaded {
+                    album_id: album_id.to_owned(),
+                    tracks,
+                });
+            }
+            Err(err) => self.report_error("album tracks", &err),
+        }
+    }
+
+    fn handle_fetch_artist_top_tracks(&mut self, artist_id: &str) {
+        match self.call_with_refresh(|client| client.artist_top_tracks(artist_id)) {
+            Ok(tracks) => {
+                let _ = self.upd_tx.send(BackendUpdate::ArtistTracksLoaded {
+                    artist_id: artist_id.to_owned(),
+                    tracks,
+                });
+            }
+            Err(err) => self.report_error("artist top tracks", &err),
+        }
+    }
+
     fn handle_command(&mut self, cmd: AppCommand) {
         match cmd {
             AppCommand::PlayTrackId(track_id) => {
-                let uri = if track_id.starts_with("spotify:") {
-                    track_id
-                } else {
-                    format!("spotify:track:{track_id}")
-                };
+                let uri = normalize_track_uri(&track_id);
                 if let Err(err) = self.call_with_refresh(|c| c.play_uris(&[uri.as_str()])) {
                     self.report_error("play track", &err);
                 }
@@ -481,13 +558,25 @@ impl<T: HttpTransport> WorkerContext<T> {
                 }
             }
             AppCommand::EnqueueTrackId(track_id) => {
-                let uri = if track_id.starts_with("spotify:") {
-                    track_id
-                } else {
-                    format!("spotify:track:{track_id}")
-                };
+                let uri = normalize_track_uri(&track_id);
                 if let Err(err) = self.call_with_refresh(|c| c.queue_track(&uri)) {
                     self.report_error("enqueue track", &err);
+                }
+            }
+            AppCommand::AddTracksToPlaylist {
+                playlist_id,
+                track_ids,
+            } => {
+                if track_ids.is_empty() {
+                    return;
+                }
+                let uris: Vec<String> =
+                    track_ids.iter().map(|id| normalize_track_uri(id)).collect();
+                let uri_refs: Vec<&str> = uris.iter().map(String::as_str).collect();
+                if let Err(err) =
+                    self.call_with_refresh(|c| c.add_tracks_to_playlist(&playlist_id, &uri_refs))
+                {
+                    self.report_error("add tracks to playlist", &err);
                 }
             }
             AppCommand::TransferDevice(device_id) => {
@@ -545,6 +634,14 @@ impl<T: HttpTransport> WorkerContext<T> {
     }
 }
 
+fn normalize_track_uri(track_id: &str) -> String {
+    if track_id.starts_with("spotify:") {
+        track_id.to_owned()
+    } else {
+        format!("spotify:track:{track_id}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -569,6 +666,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines)]
     fn dispatches_commands_hydrates_redb_and_degrades_gracefully_on_403() {
         let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
         let db_path = std::env::temp_dir().join(format!(
@@ -577,12 +675,22 @@ mod tests {
         ));
 
         let transport = MockSpotifyTransport::new();
-        // Bootstrap responses: me, liked_tracks, playlists, recently_played (403!), playback, devices
+        // Bootstrap: me, liked_tracks, playlists, saved_albums, followed_artists (403),
+        // saved_episodes, recently_played (403!), playback, devices
         transport.push_json(
             200,
             r#"{"id":"u1","display_name":"Ada","product":"premium"}"#,
         );
         transport.push_json(200, r#"{"items":[]}"#);
+        transport.push_json(200, r#"{"items":[]}"#);
+        transport.push_json(
+            200,
+            r#"{"items":[{"album":{"id":"alb1","name":"Discovery","release_date":"2001-03-12","artists":[{"name":"Daft Punk"}],"images":[]}}]}"#,
+        );
+        transport.push_response(HttpResponse::new(
+            403,
+            r#"{"error":{"message":"restricted"}}"#,
+        ));
         transport.push_json(200, r#"{"items":[]}"#);
         transport.push_response(HttpResponse::new(
             403,
@@ -590,12 +698,17 @@ mod tests {
         ));
         transport.push_response(HttpResponse::new(204, ""));
         transport.push_json(200, r#"{"devices":[]}"#);
-        // Command responses: PlayTrackId, SetVolume, ExecuteSearch
+        // Command responses: PlayTrackId, SetVolume, AddTracksToPlaylist, ExecuteSearch, FetchAlbumTracks
         transport.push_response(HttpResponse::new(204, ""));
         transport.push_response(HttpResponse::new(204, ""));
+        transport.push_json(201, r#"{"snapshot_id":"snap-2"}"#);
         transport.push_json(
             200,
             r#"{"tracks":{"items":[{"id":"t9","name":"Voyager","duration_ms":227000,"explicit":false,"artists":[{"name":"Daft Punk"}],"album":{"name":"Discovery","images":[]}}]}}"#,
+        );
+        transport.push_json(
+            200,
+            r#"{"items":[{"id":"t10","name":"Veridis Quo","duration_ms":344000,"explicit":false,"artists":[{"name":"Daft Punk"}]}]}"#,
         );
 
         let cache = RedbMetadataCache::open(&db_path).ok();
@@ -616,12 +729,20 @@ mod tests {
             String::from("t9"),
         )));
         worker.send(BackendRequest::Command(AppCommand::SetVolume(75)));
+        worker.send(BackendRequest::Command(AppCommand::AddTracksToPlaylist {
+            playlist_id: String::from("pl1"),
+            track_ids: vec![String::from("t9")],
+        }));
         worker.send(BackendRequest::Command(AppCommand::ExecuteSearch(
             String::from("voyager"),
         )));
+        worker.send(BackendRequest::FetchAlbumTracks {
+            album_id: String::from("alb1"),
+        });
 
         let mut saw_live_hydration = false;
         let mut saw_search = false;
+        let mut saw_album_tracks = false;
         let mut saw_error_toast = false;
 
         for _ in 0..40 {
@@ -629,10 +750,13 @@ mod tests {
                 match upd {
                     BackendUpdate::MetadataHydrated {
                         user: Some(ref u),
+                        ref library,
                         from_cache: false,
                         ..
                     } => {
                         assert_eq!(u.display_name, "Ada");
+                        assert_eq!(library.albums.len(), 1);
+                        assert_eq!(library.albums[0].title, "Discovery");
                         saw_live_hydration = true;
                     }
                     BackendUpdate::SearchResultsLoaded(ref res) => {
@@ -640,13 +764,22 @@ mod tests {
                         assert_eq!(res.tracks[0].title, "Voyager");
                         saw_search = true;
                     }
+                    BackendUpdate::AlbumTracksLoaded {
+                        ref album_id,
+                        ref tracks,
+                    } => {
+                        assert_eq!(album_id, "alb1");
+                        assert_eq!(tracks.len(), 1);
+                        assert_eq!(tracks[0].title, "Veridis Quo");
+                        saw_album_tracks = true;
+                    }
                     BackendUpdate::Toast { .. } => {
                         saw_error_toast = true;
                     }
                     _ => {}
                 }
             }
-            if saw_live_hydration && saw_search {
+            if saw_live_hydration && saw_search && saw_album_tracks {
                 break;
             }
             std::thread::sleep(Duration::from_millis(15));
@@ -656,7 +789,8 @@ mod tests {
 
         assert!(saw_live_hydration);
         assert!(saw_search);
-        // 403 on recently_played must degrade silently with zero error toast!
+        assert!(saw_album_tracks);
+        // 403 on followed_artists & recently_played must degrade silently with zero error toast!
         assert!(!saw_error_toast);
 
         // Verify redb persisted the hydrated profile cleanly.
@@ -667,6 +801,7 @@ mod tests {
                 meta.user.as_ref().map(|u| u.display_name.as_str()),
                 Some("Ada")
             );
+            assert_eq!(meta.library.albums.len(), 1);
         }
 
         let _ = fs::remove_file(&db_path);

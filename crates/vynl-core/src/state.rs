@@ -207,6 +207,13 @@ pub enum AppEvent {
     ToggleCurrentLike,
     /// Add a track to the explicit playback queue.
     EnqueueTrack(TrackSummary),
+    /// Add one or more tracks to a user playlist.
+    AddTracksToPlaylist {
+        /// Target Spotify playlist ID.
+        playlist_id: String,
+        /// Spotify track IDs to append to the playlist.
+        track_ids: Vec<String>,
+    },
     /// Switch active Spotify Connect device by index.
     SelectDevice(usize),
     /// Open or toggle a floating modal.
@@ -252,6 +259,13 @@ pub enum AppCommand {
     },
     /// Queue a track ID on Spotify Connect.
     EnqueueTrackId(String),
+    /// Append tracks to a Spotify playlist.
+    AddTracksToPlaylist {
+        /// Target Spotify playlist ID.
+        playlist_id: String,
+        /// Spotify track IDs to append to the playlist.
+        track_ids: Vec<String>,
+    },
     /// Transfer playback to a Spotify Connect device ID.
     TransferDevice(String),
     /// Trigger debounced remote search.
@@ -582,6 +596,35 @@ pub fn reduce(state: &mut AppState, event: AppEvent) -> Vec<AppCommand> {
             });
             commands.push(AppCommand::EnqueueTrackId(id));
         }
+        AppEvent::AddTracksToPlaylist {
+            playlist_id,
+            track_ids,
+        } => {
+            state.modal = None;
+            if !track_ids.is_empty() {
+                let added_count = u32::try_from(track_ids.len()).unwrap_or(u32::MAX);
+                let playlist_name = if let Some(playlist) = state
+                    .library
+                    .playlists
+                    .iter_mut()
+                    .find(|p| p.id == playlist_id)
+                {
+                    playlist.track_count = playlist.track_count.saturating_add(added_count);
+                    playlist.name.clone()
+                } else {
+                    playlist_id.clone()
+                };
+                state.toast = Some(ToastMessage {
+                    level: ToastLevel::Info,
+                    text: format!("Added {} track(s) to {playlist_name}", track_ids.len()),
+                    ttl_ticks: 12,
+                });
+                commands.push(AppCommand::AddTracksToPlaylist {
+                    playlist_id,
+                    track_ids,
+                });
+            }
+        }
         AppEvent::SelectDevice(idx) => {
             if let Some(device) = state.devices.get(idx).cloned() {
                 for (i, d) in state.devices.iter_mut().enumerate() {
@@ -624,7 +667,7 @@ pub fn reduce(state: &mut AppState, event: AppEvent) -> Vec<AppCommand> {
 
 #[cfg(test)]
 mod tests {
-    use crate::model::TrackSummary;
+    use crate::model::{PlaylistSummary, ToastLevel, TrackSummary};
 
     use super::{ActiveModal, AppCommand, AppEvent, AppState, LayoutBreakpoint, Route, reduce};
 
@@ -690,5 +733,73 @@ mod tests {
         assert_eq!(state.modal, Some(ActiveModal::Help));
         reduce(&mut state, AppEvent::DismissModal);
         assert_eq!(state.modal, None);
+    }
+
+    #[test]
+    fn add_tracks_to_playlist_updates_state_and_emits_command() {
+        let mut state = AppState::default();
+        state.library.playlists.push(PlaylistSummary {
+            id: String::from("pl_focus"),
+            name: String::from("Deep Focus"),
+            description: String::from("Instrumental coding tracks"),
+            owner: String::from("Alex"),
+            track_count: 10,
+            snapshot_id: String::from("snap-1"),
+            pinned: false,
+            folder: None,
+            cover: None,
+        });
+        state.modal = Some(ActiveModal::AddToPlaylist {
+            track_ids: vec![String::from("t1"), String::from("t2")],
+            selected: 0,
+        });
+
+        let cmds = reduce(
+            &mut state,
+            AppEvent::AddTracksToPlaylist {
+                playlist_id: String::from("pl_focus"),
+                track_ids: vec![String::from("t1"), String::from("t2")],
+            },
+        );
+
+        assert_eq!(state.library.playlists[0].track_count, 12);
+        assert_eq!(state.modal, None);
+        assert_eq!(
+            state.toast.as_ref().map(|t| (t.level, t.text.as_str())),
+            Some((ToastLevel::Info, "Added 2 track(s) to Deep Focus"))
+        );
+        assert_eq!(
+            cmds,
+            vec![AppCommand::AddTracksToPlaylist {
+                playlist_id: String::from("pl_focus"),
+                track_ids: vec![String::from("t1"), String::from("t2")],
+            }]
+        );
+
+        // Verify saturating arithmetic and empty track_ids suppression
+        state.library.playlists[0].track_count = u32::MAX;
+        let sat_cmds = reduce(
+            &mut state,
+            AppEvent::AddTracksToPlaylist {
+                playlist_id: String::from("pl_focus"),
+                track_ids: vec![String::from("t3")],
+            },
+        );
+        assert_eq!(state.library.playlists[0].track_count, u32::MAX);
+        assert_eq!(sat_cmds.len(), 1);
+
+        state.modal = Some(ActiveModal::AddToPlaylist {
+            track_ids: Vec::new(),
+            selected: 0,
+        });
+        let empty_cmds = reduce(
+            &mut state,
+            AppEvent::AddTracksToPlaylist {
+                playlist_id: String::from("pl_focus"),
+                track_ids: Vec::new(),
+            },
+        );
+        assert_eq!(state.modal, None);
+        assert_eq!(empty_cmds, []);
     }
 }

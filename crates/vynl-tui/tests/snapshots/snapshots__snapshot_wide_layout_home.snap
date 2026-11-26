@@ -1,0 +1,40 @@
+---
+source: crates/vynl-tui/tests/snapshots.rs
+expression: frame.to_plain_text()
+---
+╭─ vynl ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│[<]         / Search songs, artists, albums... (Ctrl+P Palette)                                                           Vinyl Explorer [?]        │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ Library ────────────────╮╭─ Home ─────────────────────────────────────────────────────────────────────────────────╮╭─ Now Playing [q: Queue] ─────╮
+│* Home                    ││Featured Albums & Cover Grid                                                            ││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀│
+│  Search                  ││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀               ││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀│
+│  Liked Songs             ││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀               ││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀│
+│  Podcasts                ││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀               ││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀│
+│  Zen Mode                ││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀               ││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀│
+│                          ││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀               ││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀│
+│[Filter: All]             ││Random Access Mem… The Dark Side of … Kind of Blue       In Rainbows                    ││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀│
+│* Late Night Rust & Synth…││Daft Punk (2013)   Pink Floyd (1973)  Miles Davis (1959) Radiohead (2007)               ││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀│
+│* Midnight Vinyl Jazz (4) ││                                                                                        ││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀│
+│  Classic Wax Pressing (5)││                                                                                        ││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀│
+│  Neon & Arpeggi (5)      ││Jump Back In — Tracks (Enter to play, L to like, a to queue)                            ││                              │
+│  Audiophile Reference (6)││ #  Title                      Artist               Time                                ││Instant Crush                 │
+│                          ││ >  1 Instant Crush            Daft Punk, Julian…  ♥ 05:37                              ││Daft Punk, Julian Casablancas │
+│                          ││    2 Giorgio by Moroder       Daft Punk           ♥ 09:04                              ││Random Access Memories        │
+│                          ││    3 Give Life Back to Music  Daft Punk           ♥ 04:34                              ││                              │
+│                          ││    4 Time                     Pink Floyd          ♥ 06:53                              ││Next in Queue:                │
+│                          ││    5 Breathe (In the Air)     Pink Floyd          ♥ 02:49                              ││Giorgio by Moroder — Daft Punk│
+│                          ││    6 So What                  Miles Davis         ♥ 09:22                              ││                              │
+│                          ││    7 Blue in Green            Miles Davis, Bill…  ♥ 05:27                              ││                              │
+│                          ││    8 Weird Fishes / Arpeggi   Radiohead           ♥ 05:18                              ││                              │
+│                          ││    9 Reckoner                 Radiohead           ♥ 04:50                              ││                              │
+│                          ││   10 Dreams                   Fleetwood Mac       ♥ 04:17                              ││                              │
+│                          ││   11 The Chain                Fleetwood Mac       ♥ 04:30                              ││                              │
+│                          ││   12 Let It Happen            Tame Impala         ♥ 07:47                              ││                              │
+│                          ││   13 The Less I Know the Bet… Tame Impala        E♥ 03:36                              ││                              │
+│                          ││   14 Nights                   Frank Ocean        E♥ 05:07                              ││                              │
+│                          ││   15 Pink + White             Frank Ocean         ♥ 03:04                              ││                              │
+╰──────────────────────────╯╰────────────────────────────────────────────────────────────────────────────────────────╯╰──────────────────────────────╯
+╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│▀▀▀▀ Instant Crush ♥                                       [S] [|<] [||] [>|] [R:context]                                             Vol  78%      │
+│▀▀▀▀ Daft Punk, Julian Casablancas  01:24 ━━━━━━━━━━━━━━━●───────────────────────────────────────────── 05:37                         vynl (Integ…  │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
