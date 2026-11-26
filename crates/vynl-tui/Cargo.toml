@@ -27,5 +27,8 @@ vynl-spotify.workspace = true
 vynl-system.workspace = true
 crossterm.workspace = true
 
+[dev-dependencies]
+insta.workspace = true
+
 [lints]
 workspace = true

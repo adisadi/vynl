@@ -402,6 +402,33 @@ impl RgbImage {
         Ok(decoded)
     }
 
+    /// Encodes the image as a lossless PNG byte buffer.
+    ///
+    /// # Errors
+    /// Returns an error if the image is empty, its pixel buffer does not match
+    /// `width * height * 3`, or PNG encoding fails.
+    pub fn encode_png(&self) -> Result<Vec<u8>, String> {
+        if self.is_empty() {
+            return Err(String::from("cannot encode empty image as PNG"));
+        }
+
+        let raw = image::RgbImage::from_raw(self.width, self.height, self.pixels.clone())
+            .ok_or_else(|| {
+                format!(
+                    "invalid RGB24 pixel buffer for {}x{} PNG encoding (got {} bytes)",
+                    self.width,
+                    self.height,
+                    self.pixels.len()
+                )
+            })?;
+
+        let mut out = Vec::new();
+        let encoder = image::codecs::png::PngEncoder::new(&mut out);
+        raw.write_with_encoder(encoder)
+            .map_err(|err| format!("failed to encode PNG: {err}"))?;
+        Ok(out)
+    }
+
     /// Encodes the image as an uncompressed 24-bit Windows BMP (`BGR24`, bottom-up)
     /// suitable for `iTerm2` OSC 1337 inline image payloads.
     #[must_use]
@@ -940,6 +967,24 @@ mod tests {
         assert!(RgbImage::decode_encoded(b"").is_err());
         assert!(RgbImage::decode_encoded(b"definitely-not-an-image").is_err());
         assert!(RgbImage::decode_encoded(b"P6\n0 0\n255\n").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn encode_png_round_trips_losslessly_with_decode_encoded() -> Result<(), String> {
+        let img = generate_demo_cover("album:png-roundtrip", 24);
+        let png = img.encode_png()?;
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+        let decoded = RgbImage::decode_encoded(&png)?;
+        assert_eq!(decoded, img);
+
+        let empty = RgbImage {
+            width: 0,
+            height: 0,
+            pixels: Vec::new(),
+        };
+        assert!(empty.encode_png().is_err());
         Ok(())
     }
 }

@@ -6,6 +6,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vynl_core::theme::Rgb;
@@ -305,6 +306,67 @@ impl L2DiskCache {
         Ok(path)
     }
 
+    /// Exports a cached image for `key` to `dest` as a lossless PNG file.
+    ///
+    /// Returns `Ok(false)` on cache miss without creating `dest`. On cache hit,
+    /// creates parent directories if needed, atomically writes the PNG via a
+    /// temporary file and rename, and returns `Ok(true)`.
+    ///
+    /// # Errors
+    /// Returns an error if reading the cached PPM entry, encoding PNG bytes,
+    /// creating parent directories, or atomically writing `dest` fails.
+    pub fn export_png(&self, key: &str, dest: &Path) -> Result<bool, String> {
+        static EXPORT_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let Some(img) = self.get(key)? else {
+            return Ok(false);
+        };
+
+        let png_bytes = img.encode_png()?;
+
+        if let Some(parent) = dest.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "failed to create PNG export directory {}: {err}",
+                    parent.display()
+                )
+            })?;
+        }
+
+        let seq = EXPORT_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_name = format!(
+            ".vynl-export-{:016x}.{}.{seq}.tmp",
+            fnv1a_64(key),
+            std::process::id()
+        );
+        let tmp_path = match dest.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
+            _ => PathBuf::from(tmp_name),
+        };
+
+        fs::write(&tmp_path, &png_bytes).map_err(|err| {
+            format!(
+                "failed to write temp PNG export {}: {err}",
+                tmp_path.display()
+            )
+        })?;
+
+        if let Err(rename_err) = fs::rename(&tmp_path, dest) {
+            let _ = fs::remove_file(dest);
+            fs::rename(&tmp_path, dest).map_err(|err| {
+                let _ = fs::remove_file(&tmp_path);
+                format!(
+                    "failed to commit PNG export {} (first err: {rename_err}): {err}",
+                    dest.display()
+                )
+            })?;
+        }
+
+        Ok(true)
+    }
+
     /// Returns the total size in bytes of all `.ppm` files currently stored in the cache.
     ///
     /// # Errors
@@ -511,6 +573,43 @@ mod tests {
         assert_eq!(cache.get("disk://3")?, Some(img3));
 
         let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn l2_disk_cache_export_png_handles_miss_and_hit() -> Result<(), String> {
+        use crate::image::RgbImage;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let root = env::temp_dir().join(format!(
+            "vynl-images-export-png-{}-{nonce}",
+            std::process::id()
+        ));
+        let cache_dir = root.join("cache");
+        let export_dest = root.join("nested").join("icons").join("cover.png");
+
+        let cache = L2DiskCache::new(cache_dir, 1024 * 1024)?;
+
+        // Cache miss returns Ok(false) and does not create the destination file.
+        assert!(!cache.export_png("missing://cover", &export_dest)?);
+        assert!(!export_dest.exists());
+
+        // Cache hit creates parent dirs, writes a valid lossless PNG, and returns Ok(true).
+        let cover = generate_demo_cover("export://cover", 20);
+        cache.put("export://cover", &cover)?;
+        assert!(cache.export_png("export://cover", &export_dest)?);
+        assert!(export_dest.exists());
+
+        let exported_bytes =
+            fs::read(&export_dest).map_err(|err| format!("failed to read exported PNG: {err}"))?;
+        assert!(exported_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+        let decoded = RgbImage::decode_encoded(&exported_bytes)?;
+        assert_eq!(decoded, cover);
+
+        let _ = fs::remove_dir_all(&root);
         Ok(())
     }
 }

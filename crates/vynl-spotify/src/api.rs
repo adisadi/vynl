@@ -1038,6 +1038,124 @@ impl<T: HttpTransport> SpotifyApiClient<T> {
             .collect())
     }
 
+    /// Fetches the user's saved albums (`GET /me/albums?limit=50`).
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] on transport, auth, restriction, rate-limit, or parse failures.
+    pub fn saved_albums(&self) -> Result<Vec<AlbumSummary>, ApiError> {
+        let resp = self.send_api(HttpMethod::Get, "/me/albums?limit=50", &[], None)?;
+        let json = parse_json(&resp.body).map_err(ApiError::Parse)?;
+        let Some(items) = json.get_array("items") else {
+            return Ok(Vec::new());
+        };
+        Ok(items
+            .iter()
+            .filter_map(|entry| entry.get("album").and_then(parse_album))
+            .collect())
+    }
+
+    /// Fetches tracks belonging to `album_id` (`GET /albums/{album_id}/tracks?limit=50`).
+    ///
+    /// Spotify's album tracks endpoint omits the nested `album` object on each item,
+    /// so returned tracks default their `album` field to `""`.
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] on transport, auth, restriction, rate-limit, or parse failures.
+    pub fn album_tracks(&self, album_id: &str) -> Result<Vec<TrackSummary>, ApiError> {
+        let path = format!("/albums/{}/tracks?limit=50", percent_encode(album_id));
+        let resp = self.send_api(HttpMethod::Get, &path, &[], None)?;
+        let json = parse_json(&resp.body).map_err(ApiError::Parse)?;
+        let Some(items) = json.get_array("items") else {
+            return Ok(Vec::new());
+        };
+        Ok(items
+            .iter()
+            .filter_map(|item| parse_track_with_album_fallback(item, ""))
+            .collect())
+    }
+
+    /// Lists artists followed by the current user (`GET /me/following?type=artist&limit=50`).
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] on transport, auth, restriction, rate-limit, or parse failures.
+    pub fn followed_artists(&self) -> Result<Vec<ArtistSummary>, ApiError> {
+        let resp = self.send_api(
+            HttpMethod::Get,
+            "/me/following?type=artist&limit=50",
+            &[],
+            None,
+        )?;
+        let json = parse_json(&resp.body).map_err(ApiError::Parse)?;
+        let Some(items) = json
+            .get_path(&["artists", "items"])
+            .and_then(JsonValue::as_array)
+        else {
+            return Ok(Vec::new());
+        };
+        let mut artists = Vec::with_capacity(items.len());
+        for entry in items {
+            if let Some(mut artist) = parse_artist(entry) {
+                artist.following = true;
+                artists.push(artist);
+            }
+        }
+        Ok(artists)
+    }
+
+    /// Fetches an artist's top tracks (`GET /artists/{artist_id}/top-tracks`).
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] on transport, auth, restriction, rate-limit, or parse failures.
+    pub fn artist_top_tracks(&self, artist_id: &str) -> Result<Vec<TrackSummary>, ApiError> {
+        let path = format!("/artists/{}/top-tracks", percent_encode(artist_id));
+        let resp = self.send_api(HttpMethod::Get, &path, &[], None)?;
+        let json = parse_json(&resp.body).map_err(ApiError::Parse)?;
+        let Some(items) = json.get_array("tracks") else {
+            return Ok(Vec::new());
+        };
+        Ok(items.iter().filter_map(parse_track).collect())
+    }
+
+    /// Fetches the user's saved podcast episodes (`GET /me/episodes?limit=50`).
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] on transport, auth, restriction, rate-limit, or parse failures.
+    pub fn saved_episodes(&self) -> Result<Vec<EpisodeSummary>, ApiError> {
+        let resp = self.send_api(HttpMethod::Get, "/me/episodes?limit=50", &[], None)?;
+        let json = parse_json(&resp.body).map_err(ApiError::Parse)?;
+        let Some(items) = json.get_array("items") else {
+            return Ok(Vec::new());
+        };
+        Ok(items
+            .iter()
+            .filter_map(|entry| entry.get("episode").and_then(parse_episode))
+            .collect())
+    }
+
+    /// Appends one or more track or episode URIs to `playlist_id`
+    /// (`POST /playlists/{playlist_id}/tracks`).
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] on transport, auth, restriction, or rate-limit failures.
+    pub fn add_tracks_to_playlist(
+        &self,
+        playlist_id: &str,
+        track_uris: &[&str],
+    ) -> Result<(), ApiError> {
+        let payload = JsonValue::object([(
+            "uris",
+            JsonValue::Array(track_uris.iter().copied().map(JsonValue::from).collect()),
+        )]);
+        let body = to_json_string(&payload);
+        let headers = [(
+            String::from("Content-Type"),
+            String::from("application/json"),
+        )];
+        let path = format!("/playlists/{}/tracks", percent_encode(playlist_id));
+        self.send_api(HttpMethod::Post, &path, &headers, Some(&body))?;
+        Ok(())
+    }
+
     fn send_api(
         &self,
         method: HttpMethod,
@@ -1178,6 +1296,13 @@ fn parse_device(value: &JsonValue) -> Option<ConnectDevice> {
 }
 
 fn parse_track(value: &JsonValue) -> Option<TrackSummary> {
+    parse_track_with_album_fallback(value, "Unknown Album")
+}
+
+fn parse_track_with_album_fallback(
+    value: &JsonValue,
+    album_fallback: &str,
+) -> Option<TrackSummary> {
     if value.is_null() {
         return None;
     }
@@ -1187,7 +1312,7 @@ fn parse_track(value: &JsonValue) -> Option<TrackSummary> {
     let album_val = value.get("album");
     let album = album_val
         .and_then(|a| a.get_str("name"))
-        .unwrap_or("Unknown Album")
+        .unwrap_or(album_fallback)
         .to_owned();
     let cover = album_val.and_then(parse_first_image);
     let duration_ms = value.get_u64("duration_ms").unwrap_or(0);
@@ -1713,5 +1838,208 @@ mod tests {
                 .contains("authorization: bearer tok-req")
         );
         Ok(())
+    }
+
+    #[test]
+    fn parses_saved_albums_and_album_tracks() -> Result<(), String> {
+        let mock = MockSpotifyTransport::new();
+        mock.push_json(
+            200,
+            r#"{"items":[{"added_at":"2026-01-01T00:00:00Z","album":{"id":"alb_1","name":"Random Access Memories","artists":[{"name":"Daft Punk"}],"release_date":"2013-05-17","album_type":"album","total_tracks":13,"images":[{"url":"https://i.scdn.co/ram","width":640,"height":640}]}}]}"#,
+        );
+        mock.push_json(
+            200,
+            r#"{"items":[{"id":"t_1","name":"Give Life Back to Music","artists":[{"name":"Daft Punk"}],"duration_ms":274000,"explicit":false},{"id":"t_2","name":"Giorgio by Moroder","artists":[{"name":"Daft Punk"}],"duration_ms":544000,"explicit":true}]}"#,
+        );
+
+        let client = SpotifyApiClient::new(mock, "tok-lib").with_retry_sleep(false);
+
+        let albums = client.saved_albums().map_err(|e| e.to_string())?;
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].id, "alb_1");
+        assert_eq!(albums[0].title, "Random Access Memories");
+        assert_eq!(albums[0].artists, vec![String::from("Daft Punk")]);
+        assert_eq!(albums[0].release_year, "2013");
+        assert_eq!(albums[0].album_type, "album");
+        assert_eq!(albums[0].total_tracks, 13);
+        assert_eq!(
+            albums[0].cover.as_ref().map(|c| c.url.as_str()),
+            Some("https://i.scdn.co/ram")
+        );
+
+        let tracks = client.album_tracks("alb_1").map_err(|e| e.to_string())?;
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].id, "t_1");
+        assert_eq!(tracks[0].title, "Give Life Back to Music");
+        assert_eq!(tracks[0].album, "");
+        assert_eq!(tracks[0].cover, None);
+        assert!(!tracks[0].explicit);
+        assert_eq!(tracks[1].id, "t_2");
+        assert_eq!(tracks[1].duration_ms, 544_000);
+        assert!(tracks[1].explicit);
+
+        let reqs = client.transport().recorded_requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].method, HttpMethod::Get);
+        assert_eq!(reqs[0].url, "https://api.spotify.com/v1/me/albums?limit=50");
+        assert_eq!(reqs[0].header("Authorization"), Some("Bearer tok-lib"));
+        assert_eq!(reqs[1].method, HttpMethod::Get);
+        assert_eq!(
+            reqs[1].url,
+            "https://api.spotify.com/v1/albums/alb_1/tracks?limit=50"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_followed_artists_artist_top_tracks_and_saved_episodes() -> Result<(), String> {
+        let mock = MockSpotifyTransport::new();
+        mock.push_json(
+            200,
+            r#"{"artists":{"items":[{"id":"art_1","name":"Daft Punk","followers":{"total":10500000},"genres":["french house","electronic"],"images":[{"url":"https://i.scdn.co/dp","width":640,"height":640}]}]}}"#,
+        );
+        mock.push_json(
+            200,
+            r#"{"tracks":[{"id":"t_top","name":"Get Lucky","artists":[{"name":"Daft Punk"},{"name":"Pharrell Williams"}],"album":{"name":"Random Access Memories","images":[{"url":"https://i.scdn.co/ram","width":640,"height":640}]},"duration_ms":369000,"explicit":false}]}"#,
+        );
+        mock.push_json(
+            200,
+            r#"{"items":[{"added_at":"2026-02-01T00:00:00Z","episode":{"id":"ep_1","name":"Rust Async Deep Dive","show":{"name":"Rustacean Station"},"duration_ms":3600000,"resume_point":{"resume_position_ms":420000,"fully_played":false},"images":[{"url":"https://i.scdn.co/rs","width":300,"height":300}]}}]}"#,
+        );
+
+        let client = SpotifyApiClient::new(mock, "tok-art").with_retry_sleep(false);
+
+        let artists = client.followed_artists().map_err(|e| e.to_string())?;
+        assert_eq!(artists.len(), 1);
+        assert_eq!(artists[0].id, "art_1");
+        assert_eq!(artists[0].name, "Daft Punk");
+        assert_eq!(artists[0].followers, 10_500_000);
+        assert_eq!(
+            artists[0].genres,
+            vec![String::from("french house"), String::from("electronic")]
+        );
+        assert!(artists[0].following);
+        assert_eq!(
+            artists[0].avatar.as_ref().map(|a| a.url.as_str()),
+            Some("https://i.scdn.co/dp")
+        );
+
+        let top_tracks = client
+            .artist_top_tracks("art_1")
+            .map_err(|e| e.to_string())?;
+        assert_eq!(top_tracks.len(), 1);
+        assert_eq!(top_tracks[0].id, "t_top");
+        assert_eq!(top_tracks[0].title, "Get Lucky");
+        assert_eq!(
+            top_tracks[0].artists,
+            vec![String::from("Daft Punk"), String::from("Pharrell Williams")]
+        );
+        assert_eq!(top_tracks[0].album, "Random Access Memories");
+        assert_eq!(top_tracks[0].duration_ms, 369_000);
+
+        let episodes = client.saved_episodes().map_err(|e| e.to_string())?;
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].id, "ep_1");
+        assert_eq!(episodes[0].title, "Rust Async Deep Dive");
+        assert_eq!(episodes[0].show_name, "Rustacean Station");
+        assert_eq!(episodes[0].duration_ms, 3_600_000);
+        assert_eq!(episodes[0].resume_position_ms, 420_000);
+        assert!(!episodes[0].fully_played);
+        assert_eq!(
+            episodes[0].cover.as_ref().map(|c| c.url.as_str()),
+            Some("https://i.scdn.co/rs")
+        );
+
+        let reqs = client.transport().recorded_requests();
+        assert_eq!(reqs.len(), 3);
+        assert_eq!(reqs[0].method, HttpMethod::Get);
+        assert_eq!(
+            reqs[0].url,
+            "https://api.spotify.com/v1/me/following?type=artist&limit=50"
+        );
+        assert_eq!(reqs[1].method, HttpMethod::Get);
+        assert_eq!(
+            reqs[1].url,
+            "https://api.spotify.com/v1/artists/art_1/top-tracks"
+        );
+        assert_eq!(reqs[2].method, HttpMethod::Get);
+        assert_eq!(
+            reqs[2].url,
+            "https://api.spotify.com/v1/me/episodes?limit=50"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn add_tracks_to_playlist_sends_post_with_json_uris() -> Result<(), String> {
+        let mock = MockSpotifyTransport::new();
+        mock.push_json(201, r#"{"snapshot_id":"snap-2"}"#);
+
+        let client = SpotifyApiClient::new(mock, "tok-pl").with_retry_sleep(false);
+        client
+            .add_tracks_to_playlist("pl_42", &["spotify:track:t1", "spotify:track:t2"])
+            .map_err(|e| e.to_string())?;
+
+        let reqs = client.transport().recorded_requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, HttpMethod::Post);
+        assert_eq!(
+            reqs[0].url,
+            "https://api.spotify.com/v1/playlists/pl_42/tracks"
+        );
+        assert_eq!(reqs[0].header("Content-Type"), Some("application/json"));
+        assert_eq!(reqs[0].header("Authorization"), Some("Bearer tok-pl"));
+        assert_eq!(
+            reqs[0].body.as_deref(),
+            Some(r#"{"uris":["spotify:track:t1","spotify:track:t2"]}"#)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn phase3_endpoints_degrade_gracefully_on_http_403() {
+        let mock = MockSpotifyTransport::new();
+        for _ in 0..6 {
+            mock.push_json(
+                403,
+                r#"{"error":{"status":403,"message":"Insufficient scope or restricted endpoint"}}"#,
+            );
+        }
+
+        let client = SpotifyApiClient::new(mock, "tok-limited").with_retry_sleep(false);
+
+        let checks: Vec<(Result<(), ApiError>, &str)> = vec![
+            (client.saved_albums().map(|_| ()), "/me/albums?limit=50"),
+            (
+                client.album_tracks("alb_1").map(|_| ()),
+                "/albums/alb_1/tracks?limit=50",
+            ),
+            (
+                client.followed_artists().map(|_| ()),
+                "/me/following?type=artist&limit=50",
+            ),
+            (
+                client.artist_top_tracks("art_1").map(|_| ()),
+                "/artists/art_1/top-tracks",
+            ),
+            (client.saved_episodes().map(|_| ()), "/me/episodes?limit=50"),
+            (
+                client.add_tracks_to_playlist("pl_1", &["spotify:track:t1"]),
+                "/playlists/pl_1/tracks",
+            ),
+        ];
+
+        for (result, expected_endpoint) in checks {
+            assert_eq!(
+                result,
+                Err(ApiError::RestrictedEndpoint {
+                    endpoint: String::from(expected_endpoint),
+                    message: String::from("Insufficient scope or restricted endpoint"),
+                })
+            );
+            if let Err(err) = result {
+                assert!(err.is_gracefully_degradable());
+            }
+        }
     }
 }

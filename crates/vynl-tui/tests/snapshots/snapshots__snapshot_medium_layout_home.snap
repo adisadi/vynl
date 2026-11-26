@@ -1,0 +1,34 @@
+---
+source: crates/vynl-tui/tests/snapshots.rs
+expression: frame.to_plain_text()
+---
+╭─ vynl ─────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│[<]         / Search songs, artists, albums... (Ctrl+P Palette)                   Vinyl Explorer [?]        │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ Library ────────────╮╭─ Home ─────────────────────────────────────────────────────────────────────────────╮
+│* Home                ││Featured Albums & Cover Grid                                                        │
+│  Search              ││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀           │
+│  Liked Songs         ││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀           │
+│  Podcasts            ││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀           │
+│  Zen Mode            ││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀           │
+│                      ││▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀           │
+│[Filter: All]         ││Random Access Mem… The Dark Side of … Kind of Blue       In Rainbows                │
+│* Late Night Rust & S…││Daft Punk (2013)   Pink Floyd (1973)  Miles Davis (1959) Radiohead (2007)           │
+│* Midnight Vinyl Jazz…││                                                                                    │
+│  Classic Wax Pressin…││                                                                                    │
+│  Neon & Arpeggi (5)  ││Jump Back In — Tracks (Enter to play, L to like, a to queue)                        │
+│  Audiophile Referenc…││ #  Title                      Artist               Time                            │
+│                      ││ >  1 Instant Crush            Daft Punk, Julian…  ♥ 05:37                          │
+│                      ││    2 Giorgio by Moroder       Daft Punk           ♥ 09:04                          │
+│                      ││    3 Give Life Back to Music  Daft Punk           ♥ 04:34                          │
+│                      ││    4 Time                     Pink Floyd          ♥ 06:53                          │
+│                      ││    5 Breathe (In the Air)     Pink Floyd          ♥ 02:49                          │
+│                      ││    6 So What                  Miles Davis         ♥ 09:22                          │
+│                      ││    7 Blue in Green            Miles Davis, Bill…  ♥ 05:27                          │
+│                      ││    8 Weird Fishes / Arpeggi   Radiohead           ♥ 05:18                          │
+│                      ││    9 Reckoner                 Radiohead           ♥ 04:50                          │
+╰──────────────────────╯╰────────────────────────────────────────────────────────────────────────────────────╯
+╭────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│▀▀▀▀ Instant Crush ♥                   [S] [|<] [||] [>|] [R:context]                         Vol  78%      │
+│▀▀▀▀ Daft Punk, Julian …  01:24 ━━━━━━━━━━●────────────────────────────── 05:37               vynl (Integ…  │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
