@@ -31,6 +31,11 @@ visualizer = []
 [dependencies]
 vynl-core.workspace = true
 rodio = { workspace = true, optional = true }
+
+# librespot-core 0.8 pulls in sysinfo which links FreeBSD's libgeom.so (unavailable in zigbuild
+# cross-compile without a FreeBSD sysroot); gate librespot off FreeBSD while keeping
+# SubprocessAudioSink pure Rust on FreeBSD.
+[target.'cfg(not(target_os = "freebsd"))'.dependencies]
 librespot-core = { workspace = true, optional = true }
 librespot-playback = { workspace = true, optional = true }
 librespot-connect = { workspace = true, optional = true }

@@ -17,7 +17,24 @@ no-default-features = false
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-ignore = []
+ignore = [
+    # Upstream librespot-core 0.8.0 transitive dependencies (no newer crates.io release yet;
+    # remove as soon as librespot upgrades rsa, quick-xml, and hyper-proxy2 -> rustls 0.23):
+    # - rsa 0.9.10 (Marvin Attack; no upstream 0.10 release yet)
+    "RUSTSEC-2023-0071",
+    # - quick-xml 0.38.4 (pinned by librespot-core 0.8.0; vynl does not parse untrusted XML)
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    # - rustls 0.22.4 & rustls-webpki 0.102.8 (pinned by librespot-core 0.8.0 -> hyper-proxy2 0.1.0;
+    #   vynl's own reqwest HTTP client uses patched rustls 0.23 + rustls-webpki 0.103)
+    "RUSTSEC-2026-0049",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0346",
+    "RUSTSEC-2026-0349",
+    "RUSTSEC-2026-0382",
+]
 
 [licenses]
 # All licenses permitted for a GPL-3.0-or-later project

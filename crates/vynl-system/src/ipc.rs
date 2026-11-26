@@ -18,7 +18,7 @@ use crate::paths::AppPaths;
 pub const DEFAULT_IPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Maximum size in bytes of a single line-delimited IPC frame (`64 KiB`).
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 
 /// Default local IPC endpoint description for diagnostics.
