@@ -9,6 +9,9 @@ description = "Lean pure-Rust Spotify Web API client, OAuth PKCE flow, rate-limi
 
 [dependencies]
 vynl-core.workspace = true
+reqwest.workspace = true
+redb.workspace = true
+nucleo.workspace = true
 
 [lints]
 workspace = true

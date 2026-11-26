@@ -12,12 +12,25 @@ use std::time::Duration;
 use vynl_core::config::PlaybackMode;
 
 pub mod error;
+#[cfg(all(
+    not(target_os = "freebsd"),
+    any(feature = "rodio-backend", feature = "subprocess-backend")
+))]
+pub mod librespot_engine;
 pub mod sink;
 pub mod stream_cache;
 pub mod sync;
 pub mod visualizer;
 
 pub use error::PlayerError;
+#[cfg(all(
+    not(target_os = "freebsd"),
+    any(feature = "rodio-backend", feature = "subprocess-backend")
+))]
+pub use librespot_engine::{
+    IntegratedCommand, IntegratedEvent, IntegratedPlayerConfig, IntegratedPlayerHandle,
+    VynlLibrespotSink,
+};
 #[cfg(feature = "rodio-backend")]
 pub use sink::RodioAudioSink;
 pub use sink::{AudioFormat, AudioSink, NullAudioSink, scale_pcm_sample, scale_pcm_volume};

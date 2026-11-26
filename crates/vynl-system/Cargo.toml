@@ -10,5 +10,17 @@ description = "Local OS integrations (MPRIS2/SMTC/MediaRemote, notifications, CL
 [dependencies]
 vynl-core.workspace = true
 
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
+souvlaki.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { workspace = true, features = ["async-secret-service", "crypto-rust", "async-io"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { workspace = true, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { workspace = true, features = ["windows-native"] }
+
 [lints]
 workspace = true

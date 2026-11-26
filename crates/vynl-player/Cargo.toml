@@ -10,14 +10,36 @@ description = "Dual playback engine (librespot integrated player + Connect sync 
 [features]
 default = ["rodio-backend"]
 # Cross-platform rodio/cpal backend (Linux/macOS/Windows)
-rodio-backend = []
+rodio-backend = [
+    "dep:rodio",
+    "dep:librespot-core",
+    "dep:librespot-playback",
+    "dep:librespot-connect",
+    "dep:tokio",
+    "librespot-playback/rodio-backend",
+]
 # 100% pure-Rust PCM subprocess backend (musl, FreeBSD, exotic targets)
-subprocess-backend = []
+subprocess-backend = [
+    "dep:librespot-core",
+    "dep:librespot-playback",
+    "dep:librespot-connect",
+    "dep:tokio",
+]
 # Optional FFT spectrum tap for Zen-mode audio visualizer
 visualizer = []
 
 [dependencies]
 vynl-core.workspace = true
+rodio = { workspace = true, optional = true }
+
+# librespot-core 0.8 pulls in sysinfo which links FreeBSD's libgeom.so (unavailable in zigbuild
+# cross-compile without a FreeBSD sysroot); gate librespot off FreeBSD while keeping
+# SubprocessAudioSink pure Rust on FreeBSD.
+[target.'cfg(not(target_os = "freebsd"))'.dependencies]
+librespot-core = { workspace = true, optional = true }
+librespot-playback = { workspace = true, optional = true }
+librespot-connect = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 
 [lints]
 workspace = true

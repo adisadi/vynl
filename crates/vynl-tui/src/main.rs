@@ -3,10 +3,16 @@
 use std::env;
 use std::process::ExitCode;
 
-use vynl_core::state::{ActiveModal, AppEvent, reduce};
+use vynl_core::config::AppConfig;
 use vynl_system::ipc::{IpcClient, IpcCommand};
+use vynl_system::paths::AppPaths;
 use vynl_tui::app::VynlApp;
-use vynl_tui::{CliAction, detect_env_protocol, format_doctor_report, parse_args, usage_text};
+use vynl_tui::auth::run_auth_command;
+use vynl_tui::storage;
+use vynl_tui::{
+    CliAction, detect_env_protocol, format_doctor_report, parse_args, resolve_env_protocol,
+    usage_text,
+};
 
 fn main() -> ExitCode {
     match parse_args(env::args().skip(1)) {
@@ -22,6 +28,16 @@ fn main() -> ExitCode {
             println!("{}", format_doctor_report());
             ExitCode::SUCCESS
         }
+        Ok(CliAction::Auth(opts)) => match run_auth_command(&opts) {
+            Ok(msg) => {
+                println!("{msg}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                ExitCode::FAILURE
+            }
+        },
         Ok(CliAction::RenderDemo {
             cols,
             rows,
@@ -39,16 +55,17 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(CliAction::LaunchTui { demo }) => {
-            let proto = detect_env_protocol();
-            let mut app = VynlApp::new_demo(proto);
-            if !demo && app.config.spotify.client_id.is_none() {
-                let _ = reduce(
-                    &mut app.state,
-                    AppEvent::OpenModal(ActiveModal::SetupWizard {
-                        client_id_input: String::new(),
-                    }),
-                );
-            }
+            let paths = AppPaths::resolve();
+            let config = storage::load_config(&paths).unwrap_or_else(|err| {
+                eprintln!("warning: {err} — falling back to default config");
+                AppConfig::default()
+            });
+            let proto = resolve_env_protocol(config.images.protocol);
+            let app = if demo {
+                VynlApp::new_demo_with_config(config, paths, proto)
+            } else {
+                VynlApp::new_live(config, paths, proto)
+            };
             match app.run_interactive() {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {

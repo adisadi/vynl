@@ -1,5 +1,6 @@
-//! Atomic local metadata cache with `FNV-1a` integrity verification and a clean
-//! [`MetadataStore`] trait seam ready for a future `redb` embedded database backend.
+//! Atomic local metadata caches with `FNV-1a` integrity verification:
+//! [`MetadataCache`] (JSON file) and [`RedbMetadataCache`] (ACID embedded `redb` store),
+//! unified behind the [`MetadataStore`] trait seam.
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
@@ -8,6 +9,7 @@ use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use redb::{Database, ReadableTable, TableDefinition, TableError};
 use vynl_core::model::{
     AlbumSummary, ArtistSummary, EpisodeSummary, ImageRef, LibraryState, PlaylistSummary,
     TrackSummary, UserProfile,
@@ -20,6 +22,11 @@ pub const CACHE_SCHEMA_VERSION: u32 = 1;
 
 const FNV1A_64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A_64_PRIME: u64 = 0x0100_0000_01b3;
+
+const METADATA_TABLE: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("metadata");
+const PLAYLIST_SNAPSHOTS_TABLE: TableDefinition<'_, &str, &[u8]> =
+    TableDefinition::new("playlist_snapshots");
+const METADATA_ROOT_KEY: &str = "root";
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -284,6 +291,266 @@ impl MetadataStore for MetadataCache {
             ))),
         }
     }
+}
+
+/// Pure-Rust ACID embedded database implementation of [`MetadataStore`] backed by `redb`.
+///
+/// Stores root metadata in the `metadata` table and per-playlist track snapshots in the
+/// `playlist_snapshots` table (keyed by `playlist_id`) for `O(log N)` ACID point reads and
+/// updates, with `FNV-1a` checksum envelopes verifying payload integrity.
+#[derive(Debug)]
+pub struct RedbMetadataCache {
+    path: PathBuf,
+    db: Database,
+}
+
+impl RedbMetadataCache {
+    /// Opens or creates a `redb` metadata cache at `path`, creating parent directories if needed.
+    ///
+    /// # Errors
+    /// Returns [`CacheError::Io`] if parent directory creation or database initialization fails.
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self, CacheError> {
+        let path = path.into();
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|err| {
+                CacheError::Io(format!("failed to create redb cache directory: {err}"))
+            })?;
+        }
+
+        let db = Database::create(&path).map_err(|err| {
+            CacheError::Io(format!(
+                "failed to open redb cache at `{}`: {err}",
+                path.display()
+            ))
+        })?;
+        Ok(Self { path, db })
+    }
+
+    /// Returns the on-disk `redb` database file path backing this cache.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl MetadataStore for RedbMetadataCache {
+    fn load_metadata(&self) -> Result<Option<CachedMetadata>, CacheError> {
+        let read_txn = self.db.begin_read().map_err(|err| {
+            CacheError::Io(format!("failed starting redb read transaction: {err}"))
+        })?;
+
+        let root_meta = match read_txn.open_table(METADATA_TABLE) {
+            Ok(table) => match table
+                .get(METADATA_ROOT_KEY)
+                .map_err(|err| CacheError::Io(format!("failed reading metadata root: {err}")))?
+            {
+                Some(guard) => {
+                    let payload = decode_envelope_bytes(guard.value())?;
+                    Some(decode_metadata(&payload)?)
+                }
+                None => None,
+            },
+            Err(TableError::TableDoesNotExist(_)) => None,
+            Err(err) => {
+                return Err(CacheError::Io(format!(
+                    "failed opening redb metadata table: {err}"
+                )));
+            }
+        };
+
+        let mut snapshots = BTreeMap::new();
+        match read_txn.open_table(PLAYLIST_SNAPSHOTS_TABLE) {
+            Ok(table) => {
+                for entry in table.iter().map_err(|err| {
+                    CacheError::Io(format!("failed iterating playlist snapshots table: {err}"))
+                })? {
+                    let (key, value) = entry.map_err(|err| {
+                        CacheError::Io(format!("failed reading playlist snapshot entry: {err}"))
+                    })?;
+                    let payload = decode_envelope_bytes(value.value())?;
+                    let snap = decode_playlist_snapshot(&payload)?;
+                    snapshots.insert(key.value().to_owned(), snap);
+                }
+            }
+            Err(TableError::TableDoesNotExist(_)) => {}
+            Err(err) => {
+                return Err(CacheError::Io(format!(
+                    "failed opening redb playlist snapshots table: {err}"
+                )));
+            }
+        }
+
+        match root_meta {
+            Some(mut meta) => {
+                meta.playlist_snapshots.extend(snapshots);
+                Ok(Some(meta))
+            }
+            None if !snapshots.is_empty() => Ok(Some(CachedMetadata {
+                playlist_snapshots: snapshots,
+                ..CachedMetadata::default()
+            })),
+            None => Ok(None),
+        }
+    }
+
+    fn save_metadata(&self, metadata: &CachedMetadata) -> Result<(), CacheError> {
+        let write_txn = self.db.begin_write().map_err(|err| {
+            CacheError::Io(format!("failed starting redb write transaction: {err}"))
+        })?;
+
+        {
+            let mut meta_table = write_txn.open_table(METADATA_TABLE).map_err(|err| {
+                CacheError::Io(format!("failed opening redb metadata table: {err}"))
+            })?;
+            let encoded_root = encode_envelope(encode_metadata_root(metadata));
+            meta_table
+                .insert(METADATA_ROOT_KEY, encoded_root.as_bytes())
+                .map_err(|err| CacheError::Io(format!("failed writing metadata root: {err}")))?;
+        }
+
+        match write_txn.delete_table(PLAYLIST_SNAPSHOTS_TABLE) {
+            Ok(_) | Err(TableError::TableDoesNotExist(_)) => {}
+            Err(err) => {
+                return Err(CacheError::Io(format!(
+                    "failed resetting redb playlist snapshots table: {err}"
+                )));
+            }
+        }
+
+        {
+            let mut snap_table = write_txn
+                .open_table(PLAYLIST_SNAPSHOTS_TABLE)
+                .map_err(|err| {
+                    CacheError::Io(format!(
+                        "failed opening redb playlist snapshots table: {err}"
+                    ))
+                })?;
+            for (id, snapshot) in &metadata.playlist_snapshots {
+                let encoded = encode_envelope(encode_playlist_snapshot(snapshot));
+                snap_table
+                    .insert(id.as_str(), encoded.as_bytes())
+                    .map_err(|err| {
+                        CacheError::Io(format!("failed writing playlist snapshot `{id}`: {err}"))
+                    })?;
+            }
+        }
+
+        write_txn.commit().map_err(|err| {
+            CacheError::Io(format!("failed committing redb write transaction: {err}"))
+        })?;
+        Ok(())
+    }
+
+    fn playlist_snapshot(&self, playlist_id: &str) -> Result<Option<PlaylistSnapshot>, CacheError> {
+        let read_txn = self.db.begin_read().map_err(|err| {
+            CacheError::Io(format!("failed starting redb read transaction: {err}"))
+        })?;
+        let table = match read_txn.open_table(PLAYLIST_SNAPSHOTS_TABLE) {
+            Ok(table) => table,
+            Err(TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(err) => {
+                return Err(CacheError::Io(format!(
+                    "failed opening redb playlist snapshots table: {err}"
+                )));
+            }
+        };
+        let Some(guard) = table.get(playlist_id).map_err(|err| {
+            CacheError::Io(format!(
+                "failed reading playlist snapshot `{playlist_id}`: {err}"
+            ))
+        })?
+        else {
+            return Ok(None);
+        };
+        let payload = decode_envelope_bytes(guard.value())?;
+        decode_playlist_snapshot(&payload).map(Some)
+    }
+
+    fn upsert_playlist_snapshot(&self, snapshot: PlaylistSnapshot) -> Result<(), CacheError> {
+        let write_txn = self.db.begin_write().map_err(|err| {
+            CacheError::Io(format!("failed starting redb write transaction: {err}"))
+        })?;
+        {
+            let mut table = write_txn
+                .open_table(PLAYLIST_SNAPSHOTS_TABLE)
+                .map_err(|err| {
+                    CacheError::Io(format!(
+                        "failed opening redb playlist snapshots table: {err}"
+                    ))
+                })?;
+            let encoded = encode_envelope(encode_playlist_snapshot(&snapshot));
+            table
+                .insert(snapshot.playlist_id.as_str(), encoded.as_bytes())
+                .map_err(|err| {
+                    CacheError::Io(format!(
+                        "failed writing playlist snapshot `{}`: {err}",
+                        snapshot.playlist_id
+                    ))
+                })?;
+        }
+        write_txn.commit().map_err(|err| {
+            CacheError::Io(format!("failed committing redb write transaction: {err}"))
+        })?;
+        Ok(())
+    }
+
+    fn clear(&self) -> Result<(), CacheError> {
+        let write_txn = self.db.begin_write().map_err(|err| {
+            CacheError::Io(format!("failed starting redb write transaction: {err}"))
+        })?;
+        match write_txn.delete_table(METADATA_TABLE) {
+            Ok(_) | Err(TableError::TableDoesNotExist(_)) => {}
+            Err(err) => {
+                return Err(CacheError::Io(format!(
+                    "failed deleting redb metadata table: {err}"
+                )));
+            }
+        }
+        match write_txn.delete_table(PLAYLIST_SNAPSHOTS_TABLE) {
+            Ok(_) | Err(TableError::TableDoesNotExist(_)) => {}
+            Err(err) => {
+                return Err(CacheError::Io(format!(
+                    "failed deleting redb playlist snapshots table: {err}"
+                )));
+            }
+        }
+        write_txn.commit().map_err(|err| {
+            CacheError::Io(format!("failed committing redb clear transaction: {err}"))
+        })?;
+        Ok(())
+    }
+}
+
+fn encode_envelope(payload: JsonValue) -> String {
+    let canonical_payload = to_json_string(&payload);
+    let checksum = fnv1a_64_hex(canonical_payload.as_bytes());
+    let envelope = JsonValue::object([
+        ("checksum_fnv1a", JsonValue::from(checksum)),
+        ("payload", payload),
+    ]);
+    to_json_string(&envelope)
+}
+
+fn decode_envelope_bytes(bytes: &[u8]) -> Result<JsonValue, CacheError> {
+    let raw = std::str::from_utf8(bytes)
+        .map_err(|err| CacheError::Parse(format!("invalid UTF-8 in cache payload: {err}")))?;
+    let envelope = parse_json(raw).map_err(CacheError::Parse)?;
+    let expected = envelope
+        .get_str("checksum_fnv1a")
+        .ok_or_else(|| CacheError::Parse(String::from("cache envelope missing `checksum_fnv1a`")))?
+        .to_owned();
+    let payload = envelope
+        .get("payload")
+        .ok_or_else(|| CacheError::Parse(String::from("cache envelope missing `payload`")))?;
+
+    let canonical_payload = to_json_string(payload);
+    let actual = fnv1a_64_hex(canonical_payload.as_bytes());
+    if actual != expected {
+        return Err(CacheError::ChecksumMismatch { expected, actual });
+    }
+    Ok(payload.clone())
 }
 
 fn temp_path_for(path: &Path) -> PathBuf {
@@ -583,9 +850,19 @@ fn decode_playlist_snapshot(value: &JsonValue) -> Result<PlaylistSnapshot, Cache
 }
 
 fn encode_metadata(meta: &CachedMetadata) -> JsonValue {
+    encode_metadata_with_snapshots(meta, true)
+}
+
+fn encode_metadata_root(meta: &CachedMetadata) -> JsonValue {
+    encode_metadata_with_snapshots(meta, false)
+}
+
+fn encode_metadata_with_snapshots(meta: &CachedMetadata, include_snapshots: bool) -> JsonValue {
     let mut snapshots = BTreeMap::new();
-    for (id, snap) in &meta.playlist_snapshots {
-        snapshots.insert(id.clone(), encode_playlist_snapshot(snap));
+    if include_snapshots {
+        for (id, snap) in &meta.playlist_snapshots {
+            snapshots.insert(id.clone(), encode_playlist_snapshot(snap));
+        }
     }
 
     let library = JsonValue::object([
@@ -715,7 +992,7 @@ mod tests {
 
     use super::{
         CACHE_SCHEMA_VERSION, CacheError, CachedMetadata, MetadataCache, MetadataStore,
-        PlaylistSnapshot, fnv1a_64,
+        PlaylistSnapshot, RedbMetadataCache, fnv1a_64,
     };
 
     #[test]
@@ -779,6 +1056,151 @@ mod tests {
         ));
 
         cache.clear().map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn redb_cache_round_trips_merges_snapshots_and_clears() -> Result<(), String> {
+        let dir =
+            std::env::temp_dir().join(format!("vynl-redb-cache-roundtrip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("nested").join("metadata.redb");
+
+        let cache = RedbMetadataCache::open(&db_path).map_err(|e| e.to_string())?;
+        assert_eq!(cache.path(), db_path.as_path());
+        assert_eq!(cache.load_metadata().map_err(|e| e.to_string())?, None);
+        assert_eq!(
+            cache
+                .playlist_snapshot("missing_playlist")
+                .map_err(|e| e.to_string())?,
+            None
+        );
+
+        let demo = DemoCatalog::builtin();
+        let snap1 = PlaylistSnapshot {
+            playlist_id: String::from("pl_late_night_coding"),
+            snapshot_id: String::from("demo-snap-001"),
+            etag: Some(String::from("\"demo-snap-001\"")),
+            tracks: demo.tracks_for_playlist("pl_late_night_coding"),
+            updated_at_epoch_secs: 1_800_000_000,
+        };
+        let mut snapshots = BTreeMap::new();
+        snapshots.insert(snap1.playlist_id.clone(), snap1.clone());
+
+        let meta = CachedMetadata {
+            schema_version: CACHE_SCHEMA_VERSION,
+            updated_at_epoch_secs: 1_800_000_000,
+            user: Some(demo.user.clone()),
+            library: demo.to_library_state(),
+            playlist_snapshots: snapshots,
+            recently_played: demo.recently_played.clone(),
+        };
+
+        cache.save_metadata(&meta).map_err(|e| e.to_string())?;
+        assert_eq!(
+            cache.load_metadata().map_err(|e| e.to_string())?,
+            Some(meta.clone())
+        );
+        assert_eq!(
+            cache
+                .playlist_snapshot("pl_late_night_coding")
+                .map_err(|e| e.to_string())?,
+            Some(snap1)
+        );
+        assert_eq!(
+            cache
+                .playlist_snapshot("non_existent")
+                .map_err(|e| e.to_string())?,
+            None
+        );
+
+        // Upsert an isolated second playlist snapshot and verify root metadata + first snapshot stay intact
+        let snap2 = PlaylistSnapshot {
+            playlist_id: String::from("pl_midnight_jazz"),
+            snapshot_id: String::from("demo-snap-002"),
+            etag: Some(String::from("\"demo-snap-002\"")),
+            tracks: demo.tracks_for_playlist("pl_midnight_jazz"),
+            updated_at_epoch_secs: 1_800_000_500,
+        };
+        cache
+            .upsert_playlist_snapshot(snap2.clone())
+            .map_err(|e| e.to_string())?;
+
+        // Re-open database to verify durable ACID persistence across handles
+        drop(cache);
+        let reopened = RedbMetadataCache::open(&db_path).map_err(|e| e.to_string())?;
+        assert_eq!(
+            reopened
+                .playlist_snapshot("pl_midnight_jazz")
+                .map_err(|e| e.to_string())?,
+            Some(snap2.clone())
+        );
+
+        let merged = reopened
+            .load_metadata()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| String::from("expected merged metadata from redb"))?;
+        assert_eq!(merged.user, meta.user);
+        assert_eq!(merged.library, meta.library);
+        assert_eq!(merged.playlist_snapshots.len(), 2);
+        assert_eq!(
+            merged.playlist_snapshots.get("pl_midnight_jazz"),
+            Some(&snap2)
+        );
+
+        // Clear and verify all tables are wiped cleanly while handle stays usable
+        reopened.clear().map_err(|e| e.to_string())?;
+        assert_eq!(reopened.load_metadata().map_err(|e| e.to_string())?, None);
+        assert_eq!(
+            reopened
+                .playlist_snapshot("pl_late_night_coding")
+                .map_err(|e| e.to_string())?,
+            None
+        );
+
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn redb_cache_supports_standalone_playlist_snapshot_upsert() -> Result<(), String> {
+        let dir =
+            std::env::temp_dir().join(format!("vynl-redb-cache-isolated-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("isolated.redb");
+
+        let cache = RedbMetadataCache::open(&db_path).map_err(|e| e.to_string())?;
+        let demo = DemoCatalog::builtin();
+        let snap = PlaylistSnapshot {
+            playlist_id: String::from("pl_classic_wax"),
+            snapshot_id: String::from("demo-snap-003"),
+            etag: None,
+            tracks: demo.tracks_for_playlist("pl_classic_wax"),
+            updated_at_epoch_secs: 1_800_001_000,
+        };
+        cache
+            .upsert_playlist_snapshot(snap.clone())
+            .map_err(|e| e.to_string())?;
+
+        assert_eq!(
+            cache
+                .playlist_snapshot("pl_classic_wax")
+                .map_err(|e| e.to_string())?,
+            Some(snap.clone())
+        );
+
+        let loaded = cache
+            .load_metadata()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| String::from("expected metadata with standalone snapshot"))?;
+        assert_eq!(loaded.playlist_snapshots.get("pl_classic_wax"), Some(&snap));
+
+        cache.clear().map_err(|e| e.to_string())?;
+        assert_eq!(cache.load_metadata().map_err(|e| e.to_string())?, None);
+
+        drop(cache);
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }

@@ -9,6 +9,8 @@ description = "Terminal image protocol detection, L1/L2 caching, and Modal-Aware
 
 [dependencies]
 vynl-core.workspace = true
+image.workspace = true
+reqwest.workspace = true
 
 [lints]
 workspace = true

@@ -1,9 +1,9 @@
 //! Interactive `vynl` TUI application controller wiring `vynl-core`, `vynl-images`,
 //! `vynl-spotify`, `vynl-player`, and `vynl-system` into a unified event loop.
 
-use std::io::{self, Read, Write};
+use std::collections::{BTreeMap, HashSet};
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use vynl_core::config::AppConfig;
@@ -13,21 +13,27 @@ use vynl_core::keymap::{
 use vynl_core::model::{ToastLevel, TrackSummary};
 use vynl_core::state::{ActiveModal, AppEvent, AppState, PanelFocus, Route, reduce};
 use vynl_core::theme::Theme;
-use vynl_images::{ImageProtocol, L1ImageCache, OcclusionTracker, generate_demo_cover};
+use vynl_images::{
+    CachedFrame, HttpImageSource, ImageCacheKey, ImageProtocol, ImageSource, ImageWorker,
+    L1ImageCache, L2DiskCache, OcclusionTracker, generate_demo_cover,
+};
 use vynl_player::PlaybackEngine;
 use vynl_spotify::demo::DemoCatalog;
+use vynl_spotify::search::search_library;
 use vynl_system::ipc::{IpcCommand, IpcResponse, IpcServer, StatusSnapshot};
-use vynl_system::media::LocalMediaBridge;
+use vynl_system::media::{MediaControlEvent, SystemMediaBridge};
 use vynl_system::notify::{LocalOsNotifier, NotificationDispatcher, NotificationPayload};
 use vynl_system::paths::AppPaths;
 
 use crate::buffer::Buffer;
-use crate::input::{TerminalGuard, TerminalInput, parse_input_bytes, query_terminal_size};
+use crate::input::{TerminalGuard, TerminalInput, poll_terminal_event, query_terminal_size};
 use crate::layout::FrameLayout;
-use crate::render::{RenderContext, filter_palette_commands, render_frame};
+use crate::render::{RenderContext, filter_palette_entries, render_frame};
+use crate::spotify_worker::{BackendRequest, BackendUpdate, SpotifyWorkerHandle};
+use crate::storage;
 
 /// Live stateful application runtime owning UI state, caches, playback engine,
-/// OS integrations, and demo/Spotify catalog.
+/// OS integrations, background Spotify/image workers, and demo/live catalogs.
 pub struct VynlApp {
     /// Application configuration.
     pub config: AppConfig,
@@ -37,22 +43,42 @@ pub struct VynlApp {
     pub base_theme: Theme,
     /// Active theme (with adaptive cover accent applied when enabled).
     pub active_theme: Theme,
+    /// Custom theme names discovered in `~/.config/vynl/themes/*.toml`.
+    pub custom_themes: Vec<String>,
     /// Resolved terminal graphics protocol.
     pub protocol: ImageProtocol,
     /// L1 RAM LRU cache for encoded terminal images and palettes.
     pub l1_cache: L1ImageCache,
     /// Per-frame Modal-Aware Image Occlusion tracker.
     pub occlusion: OcclusionTracker,
-    /// Offline demo catalog (used in `--demo` and fallback browsing).
+    /// Offline demo catalog (used in `--demo` and headless snapshot tests).
     pub demo: DemoCatalog,
+    /// Whether this instance is running in offline demo mode (no live Spotify dispatch).
+    pub demo_mode: bool,
+    /// Whether configuration mutations (theme, Client ID, adaptive toggle) write to disk.
+    pub persist_config: bool,
     /// Dual playback engine & stream cache coordinator.
     pub player: Option<PlaybackEngine>,
-    /// Local OS media control metadata bridge (MPRIS2 / SMTC / `MediaRemote`).
-    pub media_bridge: LocalMediaBridge,
+    /// Live local OS media control bridge (`souvlaki` MPRIS2/SMTC/MediaRemote with fallback).
+    pub media_bridge: SystemMediaBridge,
+    /// Inbound OS media-key event receiver.
+    media_rx: mpsc::Receiver<MediaControlEvent>,
     /// Local OS desktop notifier.
     pub notifier: LocalOsNotifier,
     /// Resolved OS/XDG application paths.
     pub paths: AppPaths,
+    /// Optional non-blocking background Spotify Web API + `redb` cache worker.
+    spotify_worker: Option<SpotifyWorkerHandle>,
+    /// Cached playlist tracks loaded from Spotify / `redb`, keyed by playlist ID.
+    playlist_tracks: BTreeMap<String, Vec<TrackSummary>>,
+    /// Known playlist snapshot IDs for `If-None-Match` cache validation.
+    playlist_snapshots: BTreeMap<String, String>,
+    /// Optional background HTTP cover fetcher & JPEG/PNG/WebP decoder worker.
+    image_worker: Option<ImageWorker>,
+    /// In-flight remote cover requests so we do not enqueue duplicates per frame.
+    pending_images: HashSet<ImageCacheKey>,
+    /// Monotonic counter for [`vynl_images::ImageRequest`] IDs.
+    next_image_req_id: u64,
     /// Latest spectrum bars for Zen-mode FFT visualization.
     pub spectrum_bars: Vec<f32>,
     /// Tick counter for deterministic demo spectrum animation.
@@ -61,12 +87,98 @@ pub struct VynlApp {
 
 impl VynlApp {
     /// Creates a new `vynl` application initialized with the offline demo catalog
-    /// (ideal for `--demo`, `--render-demo`, and headless snapshot tests).
+    /// (ideal for `--render-demo` and deterministic headless snapshot tests — performs
+    /// no config disk writes or background network I/O).
     #[must_use]
     pub fn new_demo(protocol: ImageProtocol) -> Self {
         let config = AppConfig::default();
+        let paths = AppPaths::resolve();
+        Self::build_demo(config, paths, protocol, false, false)
+    }
+
+    /// Creates a `--demo` interactive application honoring loaded disk configuration
+    /// and custom themes from `~/.config/vynl/themes/*.toml`.
+    #[must_use]
+    pub fn new_demo_with_config(
+        config: AppConfig,
+        paths: AppPaths,
+        protocol: ImageProtocol,
+    ) -> Self {
+        Self::build_demo(config, paths, protocol, true, true)
+    }
+
+    /// Creates a live `vynl` application backed by disk `config.toml`, custom themes,
+    /// OS-keyring OAuth tokens, `HttpImageSource` cover art worker, `souvlaki` media
+    /// controls, and the background `SpotifyApiClient` + `redb` worker.
+    #[must_use]
+    pub fn new_live(config: AppConfig, paths: AppPaths, protocol: ImageProtocol) -> Self {
+        let custom_themes = storage::discover_custom_themes(&paths);
+        let base_theme = storage::load_theme(&paths, &config.ui.theme).unwrap_or_default();
+        let player =
+            PlaybackEngine::from_config(&config.spotify, paths.audio_cache_dir.clone()).ok();
+
+        let (media_bridge, media_rx) = if config.integrations.media_controls {
+            SystemMediaBridge::connect()
+        } else {
+            SystemMediaBridge::in_memory()
+        };
+
+        let image_worker = spawn_http_image_worker(&config, &paths);
+        let l1_cap = config.images.max_memory_cache_items;
+        let notif_enabled = config.integrations.notifications;
+
+        let mut app = Self {
+            l1_cache: L1ImageCache::new(l1_cap),
+            occlusion: OcclusionTracker::new(),
+            active_theme: base_theme.clone(),
+            base_theme,
+            custom_themes,
+            protocol,
+            state: AppState::default(),
+            demo: DemoCatalog::builtin(),
+            demo_mode: false,
+            persist_config: true,
+            player,
+            media_bridge,
+            media_rx,
+            notifier: LocalOsNotifier::new().with_enabled(notif_enabled),
+            paths,
+            config,
+            spotify_worker: None,
+            playlist_tracks: BTreeMap::new(),
+            playlist_snapshots: BTreeMap::new(),
+            image_worker,
+            pending_images: HashSet::new(),
+            next_image_req_id: 1,
+            spectrum_bars: vec![0.0; 16],
+            tick_counter: 0,
+        };
+
+        app.try_connect_live_spotify();
+        app.refresh_adaptive_theme();
+        app.sync_os_bridges(false);
+        app
+    }
+
+    fn build_demo(
+        config: AppConfig,
+        paths: AppPaths,
+        protocol: ImageProtocol,
+        persist_config: bool,
+        connect_os_media: bool,
+    ) -> Self {
         let demo = DemoCatalog::builtin();
-        let base_theme = Theme::builtin(&config.ui.theme).unwrap_or_default();
+        let custom_themes = if persist_config {
+            storage::discover_custom_themes(&paths)
+        } else {
+            Vec::new()
+        };
+        let base_theme = if persist_config {
+            storage::load_theme(&paths, &config.ui.theme).unwrap_or_default()
+        } else {
+            Theme::builtin(&config.ui.theme).unwrap_or_default()
+        };
+
         let mut state = AppState {
             user: Some(demo.user.clone()),
             library: demo.to_library_state(),
@@ -81,23 +193,41 @@ impl VynlApp {
             .clone_from(&demo.recently_played);
         state.search_results = demo.search("");
 
-        let paths = AppPaths::resolve();
         let player =
             PlaybackEngine::from_config(&config.spotify, paths.audio_cache_dir.clone()).ok();
 
+        let (media_bridge, media_rx) = if connect_os_media && config.integrations.media_controls {
+            SystemMediaBridge::connect()
+        } else {
+            SystemMediaBridge::in_memory()
+        };
+
+        let l1_cap = config.images.max_memory_cache_items;
+        let notif_enabled = config.integrations.notifications;
+
         let mut app = Self {
-            l1_cache: L1ImageCache::new(config.images.max_memory_cache_items),
+            l1_cache: L1ImageCache::new(l1_cap),
             occlusion: OcclusionTracker::new(),
             active_theme: base_theme.clone(),
             base_theme,
+            custom_themes,
             protocol,
             state,
             demo,
+            demo_mode: true,
+            persist_config,
             player,
-            media_bridge: LocalMediaBridge::new(),
-            notifier: LocalOsNotifier::new().with_enabled(config.integrations.notifications),
+            media_bridge,
+            media_rx,
+            notifier: LocalOsNotifier::new().with_enabled(notif_enabled),
             paths,
             config,
+            spotify_worker: None,
+            playlist_tracks: BTreeMap::new(),
+            playlist_snapshots: BTreeMap::new(),
+            image_worker: None,
+            pending_images: HashSet::new(),
+            next_image_req_id: 1,
             spectrum_bars: vec![0.0; 16],
             tick_counter: 0,
         };
@@ -106,19 +236,97 @@ impl VynlApp {
         app
     }
 
+    /// Attaches a pre-built [`SpotifyWorkerHandle`] (useful for tests with a mock transport)
+    /// and switches the app into live dispatch mode.
+    pub fn attach_spotify_worker(&mut self, worker: SpotifyWorkerHandle) {
+        self.demo_mode = false;
+        self.spotify_worker = Some(worker);
+    }
+
+    fn try_connect_live_spotify(&mut self) {
+        let Some(client_id) = self.config.spotify.client_id.clone() else {
+            self.dispatch(AppEvent::OpenModal(ActiveModal::SetupWizard {
+                client_id_input: String::new(),
+            }));
+            return;
+        };
+
+        match storage::load_tokens(&self.paths) {
+            Ok(Some(tokens)) => {
+                match SpotifyWorkerHandle::spawn_live(&self.paths, client_id, tokens) {
+                    Ok(worker) => {
+                        worker.send(BackendRequest::Bootstrap);
+                        self.spotify_worker = Some(worker);
+                    }
+                    Err(err) => {
+                        self.dispatch(AppEvent::ShowToast {
+                            level: ToastLevel::Error,
+                            text: format!("Failed to start Spotify worker: {err}"),
+                        });
+                    }
+                }
+            }
+            Ok(None) => {
+                self.dispatch(AppEvent::ShowToast {
+                    level: ToastLevel::Info,
+                    text: String::from(
+                        "Run `vynl auth` to sign in to Spotify (or launch with `--demo`)",
+                    ),
+                });
+            }
+            Err(err) => {
+                self.dispatch(AppEvent::ShowToast {
+                    level: ToastLevel::Warning,
+                    text: format!("Could not load saved Spotify tokens: {err} — run `vynl auth`"),
+                });
+            }
+        }
+    }
+
+    /// Central Elm reducer dispatcher: updates [`AppState`] and forwards every emitted
+    /// [`vynl_core::state::AppCommand`] to the background Spotify worker when connected.
+    fn dispatch(&mut self, event: AppEvent) {
+        let commands = reduce(&mut self.state, event);
+        if let Some(ref worker) = self.spotify_worker {
+            for cmd in commands {
+                worker.send(BackendRequest::Command(cmd));
+            }
+        }
+    }
+
     /// Computes the list of tracks currently visible for the active route + inline filter.
     #[must_use]
     pub fn active_view_tracks(&self) -> Vec<TrackSummary> {
         let base: Vec<TrackSummary> = match &self.state.route {
             Route::Home | Route::LikedSongs => self.state.library.liked_tracks.clone(),
-            Route::Playlist(id) => self.demo.tracks_for_playlist(id),
+            Route::Playlist(id) => {
+                if let Some(tracks) = self.playlist_tracks.get(id) {
+                    tracks.clone()
+                } else if self.demo_mode {
+                    self.demo.tracks_for_playlist(id)
+                } else {
+                    Vec::new()
+                }
+            }
             Route::Album(id) => self
                 .state
                 .library
                 .albums
                 .iter()
                 .find(|a| a.id == *id)
-                .map_or_else(Vec::new, |a| self.demo.tracks_for_album(&a.title)),
+                .map_or_else(Vec::new, |a| {
+                    if self.demo_mode {
+                        self.demo.tracks_for_album(&a.title)
+                    } else {
+                        self.state
+                            .library
+                            .liked_tracks
+                            .iter()
+                            .filter(|t| t.album == a.title)
+                            .cloned()
+                            .collect()
+                    }
+                }),
             Route::Artist(id) => self
                 .state
                 .library
@@ -126,8 +334,12 @@ impl VynlApp {
                 .iter()
                 .find(|a| a.id == *id)
                 .map_or_else(Vec::new, |artist| {
-                    self.demo
-                        .tracks
+                    let source = if self.demo_mode {
+                        &self.demo.tracks
+                    } else {
+                        &self.state.library.liked_tracks
+                    };
+                    source
                         .iter()
                         .filter(|t| t.artists.iter().any(|n| n == &artist.name))
                         .cloned()
@@ -153,7 +365,7 @@ impl VynlApp {
 
     /// Renders a single snapshot frame at `(cols, rows)` without touching stdout.
     pub fn render_snapshot(&mut self, cols: u16, rows: u16) -> Buffer {
-        let _ = reduce(&mut self.state, AppEvent::Resize { cols, rows });
+        self.dispatch(AppEvent::Resize { cols, rows });
         let view_tracks = self.active_view_tracks();
         let mut ctx = RenderContext {
             state: &self.state,
@@ -162,17 +374,170 @@ impl VynlApp {
             images_enabled: self.config.images.enabled,
             view_tracks: &view_tracks,
             spectrum_bars: &self.spectrum_bars,
+            custom_themes: &self.custom_themes,
             l1_cache: &mut self.l1_cache,
             occlusion: &mut self.occlusion,
+            image_worker: self.image_worker.as_ref(),
+            pending_images: &mut self.pending_images,
+            next_image_req_id: &mut self.next_image_req_id,
         };
         render_frame(cols, rows, &mut ctx)
+    }
+
+    /// Drains completed background image decodes, Spotify Web API updates, and OS media
+    /// control events without blocking the UI thread.
+    pub fn poll_background_workers(&mut self) {
+        // 1. Drain completed remote cover decodes from ImageWorker into L1 cache.
+        if let Some(ref worker) = self.image_worker {
+            let active_cover_url = self
+                .state
+                .playback
+                .current_track
+                .as_ref()
+                .and_then(|t| t.cover.as_ref())
+                .map(|c| c.url.clone());
+
+            for ready in worker.drain_ready() {
+                self.pending_images.remove(&ready.key);
+                let is_active_cover = active_cover_url.as_deref() == Some(ready.key.url.as_str());
+                let palette = ready.palette.clone();
+                self.l1_cache.insert(
+                    ready.key,
+                    CachedFrame {
+                        encoded: ready.encoded,
+                        palette: ready.palette,
+                    },
+                );
+                if is_active_cover && self.config.ui.adaptive_cover_colors && !palette.is_empty() {
+                    self.active_theme = self.base_theme.with_adaptive_palette(&palette);
+                }
+            }
+        }
+
+        // 2. Drain background Spotify Web API + redb cache updates.
+        let updates = self
+            .spotify_worker
+            .as_ref()
+            .map(SpotifyWorkerHandle::drain_updates)
+            .unwrap_or_default();
+        for update in updates {
+            self.apply_backend_update(update);
+        }
+
+        // 3. Drain inbound OS media-key events (MPRIS2 / SMTC / MediaRemote).
+        let mut media_events = Vec::new();
+        while let Ok(ev) = self.media_rx.try_recv() {
+            media_events.push(ev);
+        }
+        for ev in media_events {
+            self.handle_media_control_event(ev);
+        }
+    }
+
+    fn apply_backend_update(&mut self, update: BackendUpdate) {
+        match update {
+            BackendUpdate::MetadataHydrated {
+                user,
+                library,
+                recently_played,
+                playlist_tracks,
+                from_cache: _,
+            } => {
+                if user.is_some() {
+                    self.state.user = user;
+                }
+                self.state.library = library;
+                self.state.queue.recently_played = recently_played;
+                for (id, tracks) in playlist_tracks {
+                    self.playlist_tracks.insert(id, tracks);
+                }
+                self.clamp_selections();
+            }
+            BackendUpdate::PlaybackSynced(maybe_playback) => {
+                let prev_id = self
+                    .state
+                    .playback
+                    .current_track
+                    .as_ref()
+                    .map(|t| t.id.clone());
+                if let Some(playback) = maybe_playback {
+                    self.state.playback = playback;
+                } else {
+                    self.state.playback.is_playing = false;
+                }
+                let next_id = self
+                    .state
+                    .playback
+                    .current_track
+                    .as_ref()
+                    .map(|t| t.id.clone());
+                let changed = prev_id != next_id;
+                if changed {
+                    self.refresh_adaptive_theme();
+                }
+                self.sync_os_bridges(changed);
+            }
+            BackendUpdate::DevicesLoaded(devices) => {
+                self.state.devices = devices;
+            }
+            BackendUpdate::PlaylistTracksLoaded {
+                playlist_id,
+                snapshot_id,
+                tracks,
+            } => {
+                self.playlist_snapshots
+                    .insert(playlist_id.clone(), snapshot_id);
+                self.playlist_tracks.insert(playlist_id, tracks);
+                self.clamp_selections();
+            }
+            BackendUpdate::SearchResultsLoaded(results) => {
+                self.state.search_results = results;
+                self.clamp_selections();
+            }
+            BackendUpdate::RateLimited(retry_after) => {
+                if let Some(ref mut player) = self.player {
+                    player.sync_mut().register_rate_limit(retry_after);
+                }
+            }
+            BackendUpdate::Toast { level, text } => {
+                self.dispatch(AppEvent::ShowToast { level, text });
+            }
+        }
+    }
+
+    /// Translates an inbound OS media control event (MPRIS2 / SMTC / `MediaRemote`)
+    /// into the standard application reducer + backend dispatch pipeline.
+    pub fn handle_media_control_event(&mut self, event: MediaControlEvent) {
+        match event {
+            MediaControlEvent::Play => {
+                if !self.state.playback.is_playing {
+                    self.execute_key_action(KeyAction::TogglePlayback);
+                }
+            }
+            MediaControlEvent::Pause | MediaControlEvent::Stop => {
+                if self.state.playback.is_playing {
+                    self.execute_key_action(KeyAction::TogglePlayback);
+                }
+            }
+            MediaControlEvent::PlayPause => self.execute_key_action(KeyAction::TogglePlayback),
+            MediaControlEvent::Next => self.execute_key_action(KeyAction::NextTrack),
+            MediaControlEvent::Previous => self.execute_key_action(KeyAction::PrevTrack),
+            MediaControlEvent::SeekByMs(delta_ms) => {
+                self.dispatch(AppEvent::SeekRelative(delta_ms));
+                self.sync_os_bridges(false);
+            }
+            MediaControlEvent::SetVolume(vol) => {
+                self.dispatch(AppEvent::SetVolume(vol.min(100)));
+                self.sync_os_bridges(false);
+            }
+        }
     }
 
     /// Processes a single decoded keyboard event (handling active modals, inline filters,
     /// search input, and hybrid global keybindings).
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key == KeyEvent::ctrl('c') {
-            let _ = reduce(&mut self.state, AppEvent::Quit);
+            self.dispatch(AppEvent::Quit);
             return;
         }
 
@@ -186,18 +551,18 @@ impl VynlApp {
         if let Some(mut filter) = self.state.inline_filter.clone() {
             match key.code {
                 KeyCode::Esc => {
-                    let _ = reduce(&mut self.state, AppEvent::SetInlineFilter(None));
+                    self.dispatch(AppEvent::SetInlineFilter(None));
                     return;
                 }
                 KeyCode::Enter => return,
                 KeyCode::Backspace => {
                     filter.pop();
-                    let _ = reduce(&mut self.state, AppEvent::SetInlineFilter(Some(filter)));
+                    self.dispatch(AppEvent::SetInlineFilter(Some(filter)));
                     return;
                 }
                 KeyCode::Char(c) if !key.modifiers.ctrl && !key.modifiers.alt => {
                     filter.push(c);
-                    let _ = reduce(&mut self.state, AppEvent::SetInlineFilter(Some(filter)));
+                    self.dispatch(AppEvent::SetInlineFilter(Some(filter)));
                     return;
                 }
                 _ => {}
@@ -235,7 +600,7 @@ impl VynlApp {
     #[expect(clippy::too_many_lines)]
     fn handle_modal_key(&mut self, modal: ActiveModal, key: KeyEvent) {
         if key.code == KeyCode::Esc {
-            let _ = reduce(&mut self.state, AppEvent::DismissModal);
+            self.dispatch(AppEvent::DismissModal);
             return;
         }
 
@@ -244,7 +609,7 @@ impl VynlApp {
                 mut query,
                 mut selected,
             } => {
-                let matches = filter_palette_commands(&query);
+                let matches = filter_palette_entries(&query, &self.custom_themes);
                 match key.code {
                     KeyCode::Down => {
                         if !matches.is_empty() {
@@ -268,9 +633,9 @@ impl VynlApp {
                     }
                     KeyCode::Enter => {
                         if let Some(cmd) = matches.get(selected) {
-                            let id = cmd.id;
+                            let id = cmd.id.clone();
                             self.state.modal = None;
-                            self.execute_palette_command(id);
+                            self.execute_palette_command(&id);
                         }
                     }
                     _ => {}
@@ -288,7 +653,7 @@ impl VynlApp {
                         self.state.modal = Some(ActiveModal::DevicePicker { selected });
                     }
                     KeyCode::Enter => {
-                        let _ = reduce(&mut self.state, AppEvent::SelectDevice(selected));
+                        self.dispatch(AppEvent::SelectDevice(selected));
                     }
                     _ => {}
                 }
@@ -319,13 +684,10 @@ impl VynlApp {
                             pl.track_count = pl.track_count.saturating_add(added);
                             let name = pl.name.clone();
                             self.state.modal = None;
-                            let _ = reduce(
-                                &mut self.state,
-                                AppEvent::ShowToast {
-                                    level: ToastLevel::Info,
-                                    text: format!("Added {added} track(s) to {name}"),
-                                },
-                            );
+                            self.dispatch(AppEvent::ShowToast {
+                                level: ToastLevel::Info,
+                                text: format!("Added {added} track(s) to {name}"),
+                            });
                         }
                     }
                     _ => {}
@@ -348,17 +710,34 @@ impl VynlApp {
                     self.state.modal = Some(ActiveModal::SetupWizard { client_id_input });
                 }
                 KeyCode::Enter => {
-                    if !client_id_input.trim().is_empty() {
-                        self.config.spotify.client_id = Some(client_id_input.trim().to_owned());
+                    let trimmed = client_id_input.trim();
+                    if !trimmed.is_empty() {
+                        self.config.spotify.client_id = Some(trimmed.to_owned());
                     }
                     self.state.modal = None;
-                    let _ = reduce(
-                        &mut self.state,
-                        AppEvent::ShowToast {
+                    if self.persist_config {
+                        match storage::save_config(&self.paths, &self.config) {
+                            Ok(()) => {
+                                self.dispatch(AppEvent::ShowToast {
+                                    level: ToastLevel::Info,
+                                    text: String::from(
+                                        "Spotify Client ID saved to config.toml — run `vynl auth` to log in",
+                                    ),
+                                });
+                            }
+                            Err(err) => {
+                                self.dispatch(AppEvent::ShowToast {
+                                    level: ToastLevel::Error,
+                                    text: format!("Failed to save config.toml: {err}"),
+                                });
+                            }
+                        }
+                    } else {
+                        self.dispatch(AppEvent::ShowToast {
                             level: ToastLevel::Info,
                             text: String::from("Spotify Client ID saved"),
-                        },
-                    );
+                        });
+                    }
                 }
                 _ => {}
             },
@@ -376,88 +755,82 @@ impl VynlApp {
 
         match action {
             KeyAction::MoveUp => {
-                let _ = reduce(&mut self.state, AppEvent::MoveSelection(-1));
+                self.dispatch(AppEvent::MoveSelection(-1));
             }
             KeyAction::MoveDown => {
-                let _ = reduce(&mut self.state, AppEvent::MoveSelection(1));
+                self.dispatch(AppEvent::MoveSelection(1));
                 self.clamp_selections();
             }
             KeyAction::FocusLeft => {
-                let _ = reduce(&mut self.state, AppEvent::SetFocus(PanelFocus::Sidebar));
+                self.dispatch(AppEvent::SetFocus(PanelFocus::Sidebar));
             }
             KeyAction::FocusRight => {
-                let _ = reduce(&mut self.state, AppEvent::SetFocus(PanelFocus::Main));
+                self.dispatch(AppEvent::SetFocus(PanelFocus::Main));
             }
             KeyAction::JumpTop => {
-                let _ = reduce(&mut self.state, AppEvent::JumpSelection { top: true });
+                self.dispatch(AppEvent::JumpSelection { top: true });
             }
             KeyAction::JumpBottom => {
-                let _ = reduce(&mut self.state, AppEvent::JumpSelection { top: false });
+                self.dispatch(AppEvent::JumpSelection { top: false });
                 self.clamp_selections();
             }
             KeyAction::NextPanel => {
-                let _ = reduce(&mut self.state, AppEvent::FocusNextPanel);
+                self.dispatch(AppEvent::FocusNextPanel);
             }
             KeyAction::PrevPanel => {
-                let _ = reduce(&mut self.state, AppEvent::FocusPrevPanel);
+                self.dispatch(AppEvent::FocusPrevPanel);
             }
             KeyAction::Select => self.activate_selection(),
             KeyAction::TogglePlayback => {
-                let _ = reduce(&mut self.state, AppEvent::TogglePlayback);
+                self.dispatch(AppEvent::TogglePlayback);
             }
             KeyAction::NextTrack => {
-                let _ = reduce(&mut self.state, AppEvent::NextTrack);
+                self.dispatch(AppEvent::NextTrack);
             }
             KeyAction::PrevTrack => {
-                let _ = reduce(&mut self.state, AppEvent::PrevTrack);
+                self.dispatch(AppEvent::PrevTrack);
             }
             KeyAction::ToggleShuffle => {
-                let _ = reduce(&mut self.state, AppEvent::ToggleShuffle);
+                self.dispatch(AppEvent::ToggleShuffle);
             }
             KeyAction::CycleRepeat => {
-                let _ = reduce(&mut self.state, AppEvent::CycleRepeat);
+                self.dispatch(AppEvent::CycleRepeat);
             }
             KeyAction::VolumeUp => {
-                let _ = reduce(&mut self.state, AppEvent::AdjustVolume(5));
+                self.dispatch(AppEvent::AdjustVolume(5));
             }
             KeyAction::VolumeDown => {
-                let _ = reduce(&mut self.state, AppEvent::AdjustVolume(-5));
+                self.dispatch(AppEvent::AdjustVolume(-5));
             }
             KeyAction::ToggleMute => {
-                let _ = reduce(&mut self.state, AppEvent::ToggleMute);
+                self.dispatch(AppEvent::ToggleMute);
             }
             KeyAction::SeekForward => {
-                let _ = reduce(&mut self.state, AppEvent::SeekRelative(5_000));
+                self.dispatch(AppEvent::SeekRelative(5_000));
             }
             KeyAction::SeekBackward => {
-                let _ = reduce(&mut self.state, AppEvent::SeekRelative(-5_000));
+                self.dispatch(AppEvent::SeekRelative(-5_000));
             }
             KeyAction::OpenSearch => {
-                let _ = reduce(&mut self.state, AppEvent::Navigate(Route::Search));
-                let _ = reduce(&mut self.state, AppEvent::SetFocus(PanelFocus::Main));
+                self.dispatch(AppEvent::Navigate(Route::Search));
+                self.dispatch(AppEvent::SetFocus(PanelFocus::Main));
             }
             KeyAction::OpenInlineFilter => {
-                let _ = reduce(
-                    &mut self.state,
-                    AppEvent::SetInlineFilter(Some(String::new())),
-                );
+                self.dispatch(AppEvent::SetInlineFilter(Some(String::new())));
             }
             KeyAction::OpenCommandPalette => {
-                let _ = reduce(
-                    &mut self.state,
-                    AppEvent::OpenModal(ActiveModal::CommandPalette {
-                        query: String::new(),
-                        selected: 0,
-                    }),
-                );
+                self.dispatch(AppEvent::OpenModal(ActiveModal::CommandPalette {
+                    query: String::new(),
+                    selected: 0,
+                }));
             }
             KeyAction::ToggleLike => {
-                let _ = reduce(&mut self.state, AppEvent::ToggleCurrentLike);
+                self.dispatch(AppEvent::ToggleCurrentLike);
             }
             KeyAction::AddToQueue => {
                 let tracks = self.active_view_tracks();
                 if let Some(track) = tracks.get(self.state.main_selected).cloned() {
-                    let _ = reduce(&mut self.state, AppEvent::EnqueueTrack(track));
+                    self.dispatch(AppEvent::EnqueueTrack(track));
                 }
             }
             KeyAction::OpenPlaylistModal => {
@@ -474,42 +847,38 @@ impl VynlApp {
                     ids.push(track.id.clone());
                 }
                 if !ids.is_empty() {
-                    let _ = reduce(
-                        &mut self.state,
-                        AppEvent::OpenModal(ActiveModal::AddToPlaylist {
-                            track_ids: ids,
-                            selected: 0,
-                        }),
-                    );
+                    self.dispatch(AppEvent::OpenModal(ActiveModal::AddToPlaylist {
+                        track_ids: ids,
+                        selected: 0,
+                    }));
                 }
             }
             KeyAction::ToggleMultiSelect => {
                 let idx = self.state.main_selected;
-                let _ = reduce(&mut self.state, AppEvent::ToggleMultiSelect(idx));
+                self.dispatch(AppEvent::ToggleMultiSelect(idx));
             }
             KeyAction::OpenDevicePicker => {
-                let _ = reduce(
-                    &mut self.state,
-                    AppEvent::OpenModal(ActiveModal::DevicePicker { selected: 0 }),
-                );
+                self.dispatch(AppEvent::OpenModal(ActiveModal::DevicePicker {
+                    selected: 0,
+                }));
             }
             KeyAction::ToggleQueue => {
-                let _ = reduce(&mut self.state, AppEvent::ToggleQueuePanel);
+                self.dispatch(AppEvent::ToggleQueuePanel);
             }
             KeyAction::ToggleZenMode => {
-                let _ = reduce(&mut self.state, AppEvent::ToggleZenMode);
+                self.dispatch(AppEvent::ToggleZenMode);
             }
             KeyAction::NavigateBack => {
-                let _ = reduce(&mut self.state, AppEvent::NavigateBack);
+                self.dispatch(AppEvent::NavigateBack);
             }
             KeyAction::OpenHelp => {
-                let _ = reduce(&mut self.state, AppEvent::OpenModal(ActiveModal::Help));
+                self.dispatch(AppEvent::OpenModal(ActiveModal::Help));
             }
             KeyAction::Dismiss => {
-                let _ = reduce(&mut self.state, AppEvent::DismissModal);
+                self.dispatch(AppEvent::DismissModal);
             }
             KeyAction::Quit => {
-                let _ = reduce(&mut self.state, AppEvent::Quit);
+                self.dispatch(AppEvent::Quit);
             }
         }
 
@@ -527,6 +896,10 @@ impl VynlApp {
     }
 
     fn execute_palette_command(&mut self, id: &str) {
+        if let Some(custom_name) = id.strip_prefix("theme_custom:") {
+            self.switch_theme(custom_name);
+            return;
+        }
         match id {
             "play_pause" => self.execute_key_action(KeyAction::TogglePlayback),
             "next_track" => self.execute_key_action(KeyAction::NextTrack),
@@ -536,16 +909,10 @@ impl VynlApp {
             "device_picker" => self.execute_key_action(KeyAction::OpenDevicePicker),
             "zen_mode" => self.execute_key_action(KeyAction::ToggleZenMode),
             "toggle_queue" => self.execute_key_action(KeyAction::ToggleQueue),
-            "go_home" => {
-                let _ = reduce(&mut self.state, AppEvent::Navigate(Route::Home));
-            }
+            "go_home" => self.dispatch(AppEvent::Navigate(Route::Home)),
             "go_search" => self.execute_key_action(KeyAction::OpenSearch),
-            "go_liked" => {
-                let _ = reduce(&mut self.state, AppEvent::Navigate(Route::LikedSongs));
-            }
-            "go_podcasts" => {
-                let _ = reduce(&mut self.state, AppEvent::Navigate(Route::Podcasts));
-            }
+            "go_liked" => self.dispatch(AppEvent::Navigate(Route::LikedSongs)),
+            "go_podcasts" => self.dispatch(AppEvent::Navigate(Route::Podcasts)),
             "theme_vynl_dark" => self.switch_theme("vynl-dark"),
             "theme_catppuccin" => self.switch_theme("catppuccin-mocha"),
             "theme_tokyo_night" => self.switch_theme("tokyo-night"),
@@ -554,20 +921,20 @@ impl VynlApp {
             "toggle_adaptive" => {
                 self.config.ui.adaptive_cover_colors = !self.config.ui.adaptive_cover_colors;
                 self.refresh_adaptive_theme();
-                let _ = reduce(
-                    &mut self.state,
-                    AppEvent::ShowToast {
-                        level: ToastLevel::Info,
-                        text: format!(
-                            "Adaptive cover colors: {}",
-                            if self.config.ui.adaptive_cover_colors {
-                                "ON"
-                            } else {
-                                "OFF"
-                            }
-                        ),
-                    },
-                );
+                if self.persist_config {
+                    let _ = storage::save_config(&self.paths, &self.config);
+                }
+                self.dispatch(AppEvent::ShowToast {
+                    level: ToastLevel::Info,
+                    text: format!(
+                        "Adaptive cover colors: {}",
+                        if self.config.ui.adaptive_cover_colors {
+                            "ON"
+                        } else {
+                            "OFF"
+                        }
+                    ),
+                });
             }
             "open_help" => self.execute_key_action(KeyAction::OpenHelp),
             "quit" => self.execute_key_action(KeyAction::Quit),
@@ -575,17 +942,33 @@ impl VynlApp {
         }
     }
 
-    fn switch_theme(&mut self, name: &str) {
-        if let Some(theme) = Theme::builtin(name) {
-            self.base_theme = theme;
-            self.refresh_adaptive_theme();
-            let _ = reduce(
-                &mut self.state,
-                AppEvent::ShowToast {
+    /// Loads and activates a built-in or custom `~/.config/vynl/themes/<name>.toml` theme.
+    pub fn switch_theme(&mut self, name: &str) {
+        let loaded = if self.persist_config {
+            storage::load_theme(&self.paths, name)
+        } else {
+            Theme::builtin(name).ok_or_else(|| format!("unknown theme `{name}`"))
+        };
+
+        match loaded {
+            Ok(theme) => {
+                self.base_theme = theme;
+                name.clone_into(&mut self.config.ui.theme);
+                self.refresh_adaptive_theme();
+                if self.persist_config {
+                    let _ = storage::save_config(&self.paths, &self.config);
+                }
+                self.dispatch(AppEvent::ShowToast {
                     level: ToastLevel::Info,
                     text: format!("Theme switched to {name}"),
-                },
-            );
+                });
+            }
+            Err(err) => {
+                self.dispatch(AppEvent::ShowToast {
+                    level: ToastLevel::Error,
+                    text: format!("Could not load theme `{name}`: {err}"),
+                });
+            }
         }
     }
 
@@ -602,19 +985,27 @@ impl VynlApp {
                     idx => {
                         let pl_idx = idx.saturating_sub(5);
                         if let Some(pl) = self.state.library.playlists.get(pl_idx) {
-                            Route::Playlist(pl.id.clone())
+                            let pl_id = pl.id.clone();
+                            if let Some(ref worker) = self.spotify_worker {
+                                let cached_snap = self.playlist_snapshots.get(&pl_id).cloned();
+                                worker.send(BackendRequest::FetchPlaylistTracks {
+                                    playlist_id: pl_id.clone(),
+                                    cached_snapshot_id: cached_snap,
+                                });
+                            }
+                            Route::Playlist(pl_id)
                         } else {
                             return;
                         }
                     }
                 };
-                let _ = reduce(&mut self.state, AppEvent::Navigate(route));
-                let _ = reduce(&mut self.state, AppEvent::SetFocus(PanelFocus::Main));
+                self.dispatch(AppEvent::Navigate(route));
+                self.dispatch(AppEvent::SetFocus(PanelFocus::Main));
             }
             PanelFocus::Main | PanelFocus::RightSidebar => {
                 let tracks = self.active_view_tracks();
                 if let Some(track) = tracks.get(self.state.main_selected).cloned() {
-                    let _ = reduce(&mut self.state, AppEvent::PlayTrack(track));
+                    self.dispatch(AppEvent::PlayTrack(track));
                     self.refresh_adaptive_theme();
                     self.sync_os_bridges(true);
                 }
@@ -636,11 +1027,16 @@ impl VynlApp {
     }
 
     fn update_search(&mut self, query: String) {
-        self.state.search_results = self.demo.search(&query);
-        let _ = reduce(&mut self.state, AppEvent::SetSearchQuery(query));
+        if self.demo_mode {
+            self.state.search_results = self.demo.search(&query);
+        } else {
+            // Instant local nucleo search over cached library while remote API responds.
+            self.state.search_results = search_library(&query, &self.state.library);
+        }
+        self.dispatch(AppEvent::SetSearchQuery(query));
     }
 
-    /// Processes a decoded SGR mouse event (click, scroll wheel, drag scrubbing).
+    /// Processes a decoded mouse event (click, scroll wheel, drag scrubbing).
     pub fn handle_mouse(&mut self, event: MouseEvent, cols: u16, rows: u16) {
         if !self.config.ui.mouse_enabled {
             return;
@@ -649,10 +1045,10 @@ impl VynlApp {
 
         match event.kind {
             MouseEventKind::ScrollUp => {
-                let _ = reduce(&mut self.state, AppEvent::MoveSelection(-1));
+                self.dispatch(AppEvent::MoveSelection(-1));
             }
             MouseEventKind::ScrollDown => {
-                let _ = reduce(&mut self.state, AppEvent::MoveSelection(1));
+                self.dispatch(AppEvent::MoveSelection(1));
                 self.clamp_selections();
             }
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
@@ -664,7 +1060,8 @@ impl VynlApp {
                     let rel = u64::from(event.col.saturating_sub(layout.progress_bar.x));
                     let target = rel.saturating_mul(track.duration_ms)
                         / u64::from(layout.progress_bar.width);
-                    let _ = reduce(&mut self.state, AppEvent::SeekAbsolute(target));
+                    self.dispatch(AppEvent::SeekAbsolute(target));
+                    self.sync_os_bridges(false);
                     return;
                 }
 
@@ -673,7 +1070,8 @@ impl VynlApp {
                     let rel = u32::from(event.col.saturating_sub(layout.volume_bar.x));
                     let pct = (rel * 100) / u32::from(layout.volume_bar.width);
                     if let Ok(v) = u8::try_from(pct.min(100)) {
-                        let _ = reduce(&mut self.state, AppEvent::SetVolume(v));
+                        self.dispatch(AppEvent::SetVolume(v));
+                        self.sync_os_bridges(false);
                     }
                     return;
                 }
@@ -682,31 +1080,25 @@ impl VynlApp {
                     if let Some(sb) = layout.sidebar
                         && sb.contains(event.col, event.row)
                     {
-                        let _ = reduce(&mut self.state, AppEvent::SetFocus(PanelFocus::Sidebar));
+                        self.dispatch(AppEvent::SetFocus(PanelFocus::Sidebar));
                         let inner_row = usize::from(event.row.saturating_sub(sb.y + 1));
                         self.state.sidebar_selected = inner_row;
                         self.clamp_selections();
                         self.activate_selection();
                     } else if layout.main.contains(event.col, event.row) {
-                        let _ = reduce(&mut self.state, AppEvent::SetFocus(PanelFocus::Main));
+                        self.dispatch(AppEvent::SetFocus(PanelFocus::Main));
                     } else if let Some(rs) = layout.right_sidebar
                         && rs.contains(event.col, event.row)
                     {
-                        let _ = reduce(
-                            &mut self.state,
-                            AppEvent::SetFocus(PanelFocus::RightSidebar),
-                        );
+                        self.dispatch(AppEvent::SetFocus(PanelFocus::RightSidebar));
                     }
                 }
             }
             MouseEventKind::Down(MouseButton::Right) => {
-                let _ = reduce(
-                    &mut self.state,
-                    AppEvent::OpenModal(ActiveModal::CommandPalette {
-                        query: String::new(),
-                        selected: 0,
-                    }),
-                );
+                self.dispatch(AppEvent::OpenModal(ActiveModal::CommandPalette {
+                    query: String::new(),
+                    selected: 0,
+                }));
             }
             _ => {}
         }
@@ -745,26 +1137,31 @@ impl VynlApp {
                 )
             }
             IpcCommand::VolumeDelta(delta) => {
-                let _ = reduce(&mut self.state, AppEvent::AdjustVolume(delta));
+                self.dispatch(AppEvent::AdjustVolume(delta));
+                self.sync_os_bridges(false);
                 IpcResponse::with_status(
                     format!("volume {}%", self.state.playback.volume_percent),
                     StatusSnapshot::from_playback_state(&self.state.playback),
                 )
             }
             IpcCommand::OpenUri(uri) => {
-                let _ = reduce(
-                    &mut self.state,
-                    AppEvent::ShowToast {
-                        level: ToastLevel::Info,
-                        text: format!("Opened {uri}"),
-                    },
-                );
+                if let Some(track_id) = uri.strip_prefix("spotify:track:")
+                    && let Some(ref worker) = self.spotify_worker
+                {
+                    worker.send(BackendRequest::Command(
+                        vynl_core::state::AppCommand::PlayTrackId(track_id.to_owned()),
+                    ));
+                }
+                self.dispatch(AppEvent::ShowToast {
+                    level: ToastLevel::Info,
+                    text: format!("Opened {uri}"),
+                });
                 IpcResponse::ok(format!("opened {uri}"))
             }
         }
     }
 
-    /// Advances playback interpolation and Zen spectrum bars on periodic ticks.
+    /// Advances playback interpolation, adaptive remote polling, and Zen spectrum bars.
     pub fn on_tick(&mut self, elapsed_ms: u64) {
         self.tick_counter = self.tick_counter.saturating_add(1);
         let prev_id = self
@@ -773,7 +1170,7 @@ impl VynlApp {
             .current_track
             .as_ref()
             .map(|t| t.id.clone());
-        let _ = reduce(&mut self.state, AppEvent::Tick { elapsed_ms });
+        self.dispatch(AppEvent::Tick { elapsed_ms });
         let next_id = self
             .state
             .playback
@@ -783,6 +1180,17 @@ impl VynlApp {
         if prev_id != next_id {
             self.refresh_adaptive_theme();
             self.sync_os_bridges(true);
+        }
+
+        // Trigger adaptive remote playback sync when due (3–5s active, 20–30s paused).
+        if let Some(ref worker) = self.spotify_worker
+            && let Some(ref mut player) = self.player
+        {
+            let now = Instant::now();
+            if player.sync().should_poll_at(now) {
+                player.sync_mut().mark_polled_at(now);
+                worker.send(BackendRequest::PollPlayback);
+            }
         }
 
         if self.state.playback.is_playing {
@@ -834,11 +1242,12 @@ impl VynlApp {
         }
     }
 
-    /// Runs the full interactive TUI event loop with raw mode, diff-based rendering,
-    /// live local IPC socket server, and panic-safe terminal restoration.
+    /// Runs the full interactive TUI event loop with native `crossterm` raw mode,
+    /// diff-based rendering, background Spotify/image/media polling, live local IPC
+    /// socket server, and panic-safe terminal restoration.
     ///
     /// # Errors
-    /// Returns an I/O error if terminal setup or stdout writes fail.
+    /// Returns an I/O error if terminal setup, input polling, or stdout writes fail.
     pub fn run_interactive(self) -> io::Result<()> {
         let mouse_enabled = self.config.ui.mouse_enabled;
         let ipc_enabled = self.config.integrations.ipc_socket;
@@ -860,41 +1269,37 @@ impl VynlApp {
             None
         };
 
-        let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
-        thread::spawn(move || {
-            let mut stdin = io::stdin();
-            let mut buf = [0u8; 64];
-            loop {
-                match stdin.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if input_tx.send(buf[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-
         let mut stdout = io::stdout();
         let mut prev_frame: Option<Buffer> = None;
         let mut last_tick = Instant::now();
         let tick_interval = Duration::from_millis(250);
+        let (mut cols, mut rows) = query_terminal_size();
 
         loop {
-            let (cols, rows) = query_terminal_size();
-
-            // Drain any pending terminal input bytes
-            while let Ok(bytes) = input_rx.try_recv() {
-                let events = parse_input_bytes(&bytes);
-                if let Ok(mut app) = shared.lock() {
-                    for ev in events {
-                        match ev {
-                            TerminalInput::Key(k) => app.handle_key(k),
-                            TerminalInput::Mouse(m) => app.handle_mouse(m, cols, rows),
+            // Drain any queued native crossterm input events without blocking.
+            while let Some(ev) = poll_terminal_event(Duration::ZERO)? {
+                match ev {
+                    TerminalInput::Resize(new_cols, new_rows) => {
+                        if new_cols > 0 && new_rows > 0 {
+                            cols = new_cols;
+                            rows = new_rows;
+                        }
+                    }
+                    TerminalInput::Key(k) => {
+                        if let Ok(mut app) = shared.lock() {
+                            app.handle_key(k);
+                        }
+                    }
+                    TerminalInput::Mouse(m) => {
+                        if let Ok(mut app) = shared.lock() {
+                            app.handle_mouse(m, cols, rows);
                         }
                     }
                 }
+            }
+
+            if let Ok(mut app) = shared.lock() {
+                app.poll_background_workers();
             }
 
             if last_tick.elapsed() >= tick_interval {
@@ -922,14 +1327,23 @@ impl VynlApp {
                 break;
             }
 
-            // Wait briefly for next input chunk to keep idle CPU < 1%
-            if let Ok(bytes) = input_rx.recv_timeout(Duration::from_millis(50)) {
-                let events = parse_input_bytes(&bytes);
-                if let Ok(mut app) = shared.lock() {
-                    for ev in events {
-                        match ev {
-                            TerminalInput::Key(k) => app.handle_key(k),
-                            TerminalInput::Mouse(m) => app.handle_mouse(m, cols, rows),
+            // Sleep efficiently up to 50 ms waiting for the next native crossterm event.
+            if let Some(ev) = poll_terminal_event(Duration::from_millis(50))? {
+                match ev {
+                    TerminalInput::Resize(new_cols, new_rows) => {
+                        if new_cols > 0 && new_rows > 0 {
+                            cols = new_cols;
+                            rows = new_rows;
+                        }
+                    }
+                    TerminalInput::Key(k) => {
+                        if let Ok(mut app) = shared.lock() {
+                            app.handle_key(k);
+                        }
+                    }
+                    TerminalInput::Mouse(m) => {
+                        if let Ok(mut app) = shared.lock() {
+                            app.handle_mouse(m, cols, rows);
                         }
                     }
                 }
@@ -940,14 +1354,41 @@ impl VynlApp {
     }
 }
 
+fn spawn_http_image_worker(config: &AppConfig, paths: &AppPaths) -> Option<ImageWorker> {
+    if !config.images.enabled {
+        return None;
+    }
+    let source: Arc<dyn ImageSource> = Arc::new(HttpImageSource::new().ok()?);
+    let max_bytes = u64::from(config.images.max_disk_cache_mb).saturating_mul(1024 * 1024);
+    let disk_cache = L2DiskCache::new(paths.image_cache_dir.clone(), max_bytes)
+        .ok()
+        .map(Arc::new);
+    ImageWorker::spawn(2, &source, disk_cache.as_ref()).ok()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use vynl_core::config::AppConfig;
     use vynl_core::keymap::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
     use vynl_core::state::{ActiveModal, LayoutBreakpoint, Route};
+    use vynl_core::theme::Rgb;
     use vynl_images::ImageProtocol;
+    use vynl_spotify::api::{HttpResponse, MockSpotifyTransport};
+    use vynl_spotify::pkce::TokenBundle;
     use vynl_system::ipc::IpcCommand;
+    use vynl_system::media::MediaControlEvent;
+    use vynl_system::paths::{AppPaths, EnvSnapshot};
+
+    use crate::spotify_worker::{BackendRequest, SpotifyWorkerHandle};
+    use crate::storage;
 
     use super::VynlApp;
+
+    static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn renders_all_four_breakpoints_without_panics() {
@@ -1018,6 +1459,10 @@ mod tests {
         assert!(toggled.ok);
         assert!(!app.state.playback.is_playing);
 
+        // OS media control event resumes playback cleanly
+        app.handle_media_control_event(MediaControlEvent::Play);
+        assert!(app.state.playback.is_playing);
+
         // Mouse volume click
         let layout = crate::layout::FrameLayout::compute(150, 40, true);
         app.handle_mouse(
@@ -1030,5 +1475,104 @@ mod tests {
             40,
         );
         assert!(app.state.playback.volume_percent <= 60);
+    }
+
+    #[test]
+    fn live_app_persists_custom_themes_and_dispatches_spotify_commands() {
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("vynl-app-live-{}-{seq}", std::process::id()));
+        let env = EnvSnapshot {
+            xdg_config_home: Some(root.join("config")),
+            xdg_cache_home: Some(root.join("cache")),
+            xdg_state_home: Some(root.join("state")),
+            xdg_runtime_dir: Some(root.join("run")),
+            home: Some(root.clone()),
+            appdata: None,
+            local_appdata: None,
+            temp_dir: root.join("tmp"),
+        };
+        let paths = AppPaths::from_env(&env, false);
+        assert!(paths.ensure_dirs().is_ok());
+
+        let custom_theme_toml = r##"
+background = "#090a12"
+surface = "#111322"
+text_primary = "#f0f4ff"
+text_muted = "#8892b0"
+accent = "#00d9ff"
+border = "#242844"
+"##;
+        assert!(fs::write(paths.themes_dir.join("ocean.toml"), custom_theme_toml).is_ok());
+
+        let mut cfg = AppConfig::default();
+        cfg.ui.theme = String::from("ocean");
+        cfg.ui.adaptive_cover_colors = false;
+        cfg.integrations.media_controls = false;
+        cfg.integrations.notifications = false;
+
+        let mut app = VynlApp::new_demo_with_config(cfg, paths.clone(), ImageProtocol::Halfblocks);
+        assert_eq!(app.base_theme.name, "ocean");
+        assert_eq!(app.active_theme.accent, Rgb::new(0x00, 0xd9, 0xff));
+        assert!(app.custom_themes.contains(&String::from("ocean")));
+
+        // Switching theme persists config.toml to disk
+        app.switch_theme("nord");
+        let saved = storage::load_config(&paths);
+        assert!(saved.is_ok());
+        if let Ok(reloaded) = saved {
+            assert_eq!(reloaded.ui.theme, "nord");
+        }
+
+        // Attach a mock-backed SpotifyWorkerHandle and verify AppCommand dispatch
+        let transport = MockSpotifyTransport::new();
+        transport.push_json(
+            200,
+            r#"{"id":"u42","display_name":"Grace","product":"premium"}"#,
+        );
+        transport.push_json(200, r#"{"items":[]}"#);
+        transport.push_json(200, r#"{"items":[]}"#);
+        transport.push_json(200, r#"{"items":[]}"#);
+        transport.push_response(HttpResponse::new(204, ""));
+        transport.push_json(200, r#"{"devices":[]}"#);
+        transport.push_response(HttpResponse::new(204, ""));
+
+        let tokens = TokenBundle {
+            access_token: String::from("tok"),
+            refresh_token: String::new(),
+            expires_at_epoch_secs: u64::MAX / 2,
+        };
+        let worker_res = SpotifyWorkerHandle::spawn_with_transport(
+            transport,
+            String::from("cid"),
+            tokens,
+            None,
+            Box::new(|_| {}),
+        );
+        assert!(worker_res.is_ok());
+        if let Ok(worker) = worker_res {
+            worker.send(BackendRequest::Bootstrap);
+            app.attach_spotify_worker(worker);
+            // Trigger an AppCommand via keybinding (NextTrack)
+            app.handle_key(KeyEvent::plain(KeyCode::Char('n')));
+
+            for _ in 0..30 {
+                app.poll_background_workers();
+                if app
+                    .state
+                    .user
+                    .as_ref()
+                    .is_some_and(|u| u.display_name == "Grace")
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            assert_eq!(
+                app.state.user.as_ref().map(|u| u.display_name.as_str()),
+                Some("Grace")
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

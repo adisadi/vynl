@@ -24,7 +24,8 @@ pub use crate::protocol::{
     encode_kitty, encode_sixel,
 };
 pub use crate::worker::{
-    DemoImageSource, ImagePriority, ImageReady, ImageRequest, ImageSource, ImageWorker,
+    DEFAULT_IMAGE_TIMEOUT, DEFAULT_MAX_IMAGE_BYTES, DemoImageSource, HttpImageSource,
+    ImagePriority, ImageReady, ImageRequest, ImageSource, ImageWorker,
 };
 
 #[cfg(test)]

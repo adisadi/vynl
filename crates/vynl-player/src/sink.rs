@@ -5,9 +5,15 @@
 //! - [`NullAudioSink`] for remote-only builds and deterministic unit tests.
 //! - [`SubprocessAudioSink`] (when `subprocess-backend` is enabled) streaming little-endian
 //!   signed 16-bit PCM over `stdin` to `pw-play`, `paplay`, `aplay`, or a custom command.
-//! - [`RodioAudioSink`] (when `rodio-backend` is enabled) as the cross-platform output seam.
+//! - [`RodioAudioSink`] (when `rodio-backend` is enabled) backed by a dedicated `rodio`
+//!   hardware audio thread with graceful headless staging fallback.
 
 use crate::error::PlayerError;
+
+#[cfg(feature = "rodio-backend")]
+use std::sync::mpsc::{self, SyncSender};
+#[cfg(feature = "rodio-backend")]
+use std::thread::{self, JoinHandle};
 
 #[cfg(feature = "subprocess-backend")]
 use std::io::Write;
@@ -244,13 +250,157 @@ impl AudioSink for NullAudioSink {
     }
 }
 
-/// Cross-platform `rodio`/`cpal` audio sink seam.
-///
-/// Compiled when the `rodio-backend` feature is enabled. In offline builds without
-/// external native audio dependencies linked yet, this provides the exact [`AudioSink`]
-/// state machine and bounded PCM staging buffer so callers share a stable API.
 #[cfg(feature = "rodio-backend")]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+enum RodioCommand {
+    WritePcm(Vec<f32>),
+    SetVolume(f32),
+    Pause,
+    Resume,
+    Flush { paused: bool },
+    Shutdown,
+}
+
+#[cfg(feature = "rodio-backend")]
+#[derive(Debug)]
+struct RodioWorker {
+    tx: Option<SyncSender<RodioCommand>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(feature = "rodio-backend")]
+impl RodioWorker {
+    const CHANNEL_CAPACITY: usize = 64;
+
+    fn spawn(format: AudioFormat) -> Result<Self, PlayerError> {
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel::<RodioCommand>(Self::CHANNEL_CAPACITY);
+        let (init_tx, init_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+
+        let handle = thread::Builder::new()
+            .name(String::from("vynl-rodio-sink"))
+            .spawn(move || {
+                let mut stream = match rodio::OutputStreamBuilder::open_default_stream() {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        let _ = init_tx.send(Err(err.to_string()));
+                        return;
+                    }
+                };
+                // Suppress stderr drop diagnostics so the TUI viewport stays clean.
+                stream.log_on_drop(false);
+                let sink = rodio::Sink::connect_new(stream.mixer());
+
+                if init_tx.send(Ok(())).is_err() {
+                    sink.stop();
+                    return;
+                }
+
+                while let Ok(cmd) = cmd_rx.recv() {
+                    match cmd {
+                        RodioCommand::WritePcm(samples) => {
+                            if !samples.is_empty() {
+                                let source = rodio::buffer::SamplesBuffer::new(
+                                    format.channels,
+                                    format.sample_rate,
+                                    samples,
+                                );
+                                sink.append(source);
+                            }
+                        }
+                        RodioCommand::SetVolume(volume) => {
+                            sink.set_volume(volume);
+                        }
+                        RodioCommand::Pause => {
+                            sink.pause();
+                        }
+                        RodioCommand::Resume => {
+                            sink.play();
+                        }
+                        RodioCommand::Flush { paused } => {
+                            sink.clear();
+                            if !paused {
+                                sink.play();
+                            }
+                        }
+                        RodioCommand::Shutdown => {
+                            sink.stop();
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|err| {
+                PlayerError::BackendUnavailable(format!("failed to spawn rodio thread: {err}"))
+            })?;
+
+        match init_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                tx: Some(cmd_tx),
+                thread: Some(handle),
+            }),
+            Ok(Err(reason)) => {
+                let _ = handle.join();
+                Err(PlayerError::BackendUnavailable(format!(
+                    "failed to open default rodio audio stream: {reason}"
+                )))
+            }
+            Err(_) => {
+                let _ = handle.join();
+                Err(PlayerError::BackendUnavailable(String::from(
+                    "rodio audio thread terminated during initialization",
+                )))
+            }
+        }
+    }
+
+    fn send(&self, cmd: RodioCommand) -> Result<(), PlayerError> {
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(PlayerError::BackendUnavailable(String::from(
+                "rodio audio worker channel closed",
+            )));
+        };
+        tx.send(cmd).map_err(|_| {
+            PlayerError::BackendUnavailable(String::from("rodio audio worker thread terminated"))
+        })
+    }
+}
+
+#[cfg(feature = "rodio-backend")]
+impl Drop for RodioWorker {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.try_send(RodioCommand::Shutdown);
+            drop(tx);
+        }
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(feature = "rodio-backend")]
+fn validate_rodio_format(format: AudioFormat) -> Result<(), PlayerError> {
+    if !format.is_valid() {
+        return Err(PlayerError::InvalidFormat(format!(
+            "invalid PCM format: {} Hz, {} ch",
+            format.sample_rate, format.channels
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "rodio-backend")]
+fn i16_to_f32_pcm(sample: i16) -> f32 {
+    f32::from(sample) / 32_768.0
+}
+
+/// Cross-platform `rodio`/`cpal` audio sink backed by a dedicated audio worker thread.
+///
+/// Compiled when the `rodio-backend` feature is enabled. The underlying `rodio::OutputStream`
+/// and `rodio::Sink` live on a dedicated OS thread so [`RodioAudioSink`] remains `Send` on
+/// every platform.
+#[cfg(feature = "rodio-backend")]
+#[derive(Debug)]
 pub struct RodioAudioSink {
     format: AudioFormat,
     volume_percent: u8,
@@ -258,6 +408,7 @@ pub struct RodioAudioSink {
     samples_written: u64,
     buffer: Vec<i16>,
     max_buffer_samples: usize,
+    worker: Option<RodioWorker>,
 }
 
 #[cfg(feature = "rodio-backend")]
@@ -265,17 +416,14 @@ impl RodioAudioSink {
     /// Default staged buffer capacity (roughly 100 ms at 44.1 kHz stereo).
     pub const DEFAULT_BUFFER_SAMPLES: usize = 8_820;
 
-    /// Creates a new [`RodioAudioSink`] for the given [`AudioFormat`].
+    /// Opens a real hardware-backed `rodio` output stream on the system's default audio device.
     ///
     /// # Errors
-    /// Returns [`PlayerError::InvalidFormat`] if `format` has a zero sample rate or channel count.
-    pub fn new(format: AudioFormat) -> Result<Self, PlayerError> {
-        if !format.is_valid() {
-            return Err(PlayerError::InvalidFormat(format!(
-                "invalid PCM format: {} Hz, {} ch",
-                format.sample_rate, format.channels
-            )));
-        }
+    /// Returns [`PlayerError::InvalidFormat`] if `format` has a zero sample rate or channel count,
+    /// or [`PlayerError::BackendUnavailable`] if no audio output device is available.
+    pub fn open_default(format: AudioFormat) -> Result<Self, PlayerError> {
+        validate_rodio_format(format)?;
+        let worker = RodioWorker::spawn(format)?;
         Ok(Self {
             format,
             volume_percent: 100,
@@ -283,7 +431,39 @@ impl RodioAudioSink {
             samples_written: 0,
             buffer: Vec::with_capacity(Self::DEFAULT_BUFFER_SAMPLES),
             max_buffer_samples: Self::DEFAULT_BUFFER_SAMPLES,
+            worker: Some(worker),
         })
+    }
+
+    /// Creates a new [`RodioAudioSink`] for the given [`AudioFormat`].
+    ///
+    /// Attempts to open the system's default `rodio` hardware output stream and
+    /// gracefully falls back to an in-memory staging buffer when running in a
+    /// headless environment without an audio output device.
+    ///
+    /// # Errors
+    /// Returns [`PlayerError::InvalidFormat`] if `format` has a zero sample rate or channel count.
+    pub fn new(format: AudioFormat) -> Result<Self, PlayerError> {
+        validate_rodio_format(format)?;
+        match Self::open_default(format) {
+            Ok(sink) => Ok(sink),
+            Err(PlayerError::BackendUnavailable(_)) => Ok(Self {
+                format,
+                volume_percent: 100,
+                paused: false,
+                samples_written: 0,
+                buffer: Vec::with_capacity(Self::DEFAULT_BUFFER_SAMPLES),
+                max_buffer_samples: Self::DEFAULT_BUFFER_SAMPLES,
+                worker: None,
+            }),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Returns `true` when backed by an active `rodio` hardware output stream.
+    #[must_use]
+    pub const fn is_hardware_active(&self) -> bool {
+        self.worker.is_some()
     }
 
     /// Returns the configured [`AudioFormat`].
@@ -332,23 +512,45 @@ impl AudioSink for RodioAudioSink {
             self.buffer
                 .push(scale_pcm_volume(sample, self.volume_percent));
         }
+
+        if let Some(worker) = self.worker.as_ref()
+            && !samples.is_empty()
+        {
+            let samples_f32: Vec<f32> = samples.iter().copied().map(i16_to_f32_pcm).collect();
+            worker.send(RodioCommand::WritePcm(samples_f32))?;
+        }
         Ok(())
     }
 
     fn set_volume(&mut self, percent: u8) {
         self.volume_percent = percent.min(100);
+        if let Some(worker) = self.worker.as_ref() {
+            let linear = f32::from(self.volume_percent) / 100.0;
+            let _ = worker.send(RodioCommand::SetVolume(linear));
+        }
     }
 
     fn pause(&mut self) {
         self.paused = true;
+        if let Some(worker) = self.worker.as_ref() {
+            let _ = worker.send(RodioCommand::Pause);
+        }
     }
 
     fn resume(&mut self) {
         self.paused = false;
+        if let Some(worker) = self.worker.as_ref() {
+            let _ = worker.send(RodioCommand::Resume);
+        }
     }
 
     fn flush(&mut self) {
         self.buffer.clear();
+        if let Some(worker) = self.worker.as_ref() {
+            let _ = worker.send(RodioCommand::Flush {
+                paused: self.paused,
+            });
+        }
     }
 }
 
@@ -624,7 +826,7 @@ mod tests {
         assert_eq!(sink.volume_percent(), 100);
         sink.flush();
         assert_eq!(sink.flush_count(), 1);
-        assert_eq!(sink.captured_samples(), &[]);
+        assert_eq!(sink.captured_samples(), &[] as &[i16]);
         Ok(())
     }
 
@@ -713,6 +915,50 @@ mod tests {
             .flat_map(i16::to_le_bytes)
             .collect();
         assert_eq!(bytes, expected);
+        Ok(())
+    }
+
+    #[cfg(feature = "rodio-backend")]
+    #[test]
+    fn rodio_audio_sink_is_send_and_handles_lifecycle() -> Result<(), String> {
+        use super::RodioAudioSink;
+        use crate::error::PlayerError;
+
+        fn assert_send<T: Send>() {}
+        assert_send::<RodioAudioSink>();
+
+        assert!(matches!(
+            RodioAudioSink::new(AudioFormat::new(0, 2)),
+            Err(PlayerError::InvalidFormat(_))
+        ));
+        assert!(matches!(
+            RodioAudioSink::open_default(AudioFormat::new(44_100, 0)),
+            Err(PlayerError::InvalidFormat(_))
+        ));
+
+        let mut sink = RodioAudioSink::new(AudioFormat::CD_STEREO).map_err(|e| e.to_string())?;
+        assert_eq!(sink.format(), AudioFormat::CD_STEREO);
+        assert_eq!(sink.volume_percent(), 100);
+        assert!(!sink.is_paused());
+        let _hardware = sink.is_hardware_active();
+
+        sink.set_volume(50);
+        assert_eq!(sink.volume_percent(), 50);
+        sink.write_pcm(&[1_000, -2_000, 400, -400])
+            .map_err(|e| e.to_string())?;
+        assert_eq!(sink.samples_written(), 4);
+        assert_eq!(sink.staged_samples(), &[500, -1_000, 200, -200]);
+
+        sink.pause();
+        assert!(sink.is_paused());
+        sink.write_pcm(&[8_000, -8_000])
+            .map_err(|e| e.to_string())?;
+        assert_eq!(sink.samples_written(), 4);
+
+        sink.resume();
+        assert!(!sink.is_paused());
+        sink.flush();
+        assert_eq!(sink.staged_samples(), &[] as &[i16]);
         Ok(())
     }
 }

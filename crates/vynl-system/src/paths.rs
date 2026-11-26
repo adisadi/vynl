@@ -13,6 +13,8 @@ const APP_DIR_NAME: &str = "vynl";
 const SOCKET_FILE_NAME: &str = "vynl.sock";
 const LOG_FILE_NAME: &str = "vynl.log";
 const CONFIG_FILE_NAME: &str = "config.toml";
+const TOKENS_FILE_NAME: &str = "tokens.json";
+const METADATA_CACHE_FILE_NAME: &str = "metadata.redb";
 const WINDOWS_NAMED_PIPE: &str = r"\\.\pipe\vynl";
 
 /// Snapshot of environment variables relevant to resolving `vynl` directories.
@@ -121,6 +123,18 @@ impl AppPaths {
     #[must_use]
     pub fn config_file(&self) -> PathBuf {
         self.config_dir.join(CONFIG_FILE_NAME)
+    }
+
+    /// Returns the path to the fallback OAuth token file (`tokens.json`) inside `state_dir`.
+    #[must_use]
+    pub fn tokens_file(&self) -> PathBuf {
+        self.state_dir.join(TOKENS_FILE_NAME)
+    }
+
+    /// Returns the path to the `redb` metadata cache file (`metadata.redb`) inside `cache_dir`.
+    #[must_use]
+    pub fn metadata_cache_file(&self) -> PathBuf {
+        self.cache_dir.join(METADATA_CACHE_FILE_NAME)
     }
 
     /// Ensures that all configuration, cache, and state directories exist on disk.
@@ -244,6 +258,14 @@ mod tests {
         assert_eq!(paths.state_dir, PathBuf::from("/custom/state/vynl"));
         assert_eq!(paths.log_file, PathBuf::from("/custom/state/vynl/vynl.log"));
         assert_eq!(
+            paths.tokens_file(),
+            PathBuf::from("/custom/state/vynl/tokens.json")
+        );
+        assert_eq!(
+            paths.metadata_cache_file(),
+            PathBuf::from("/custom/cache/vynl/metadata.redb")
+        );
+        assert_eq!(
             paths.ipc_socket_path,
             PathBuf::from("/run/user/1000/vynl.sock")
         );
@@ -269,6 +291,14 @@ mod tests {
         assert_eq!(
             paths.state_dir,
             PathBuf::from("/home/bob/.local/state/vynl")
+        );
+        assert_eq!(
+            paths.tokens_file(),
+            PathBuf::from("/home/bob/.local/state/vynl/tokens.json")
+        );
+        assert_eq!(
+            paths.metadata_cache_file(),
+            PathBuf::from("/home/bob/.cache/vynl/metadata.redb")
         );
         assert_eq!(paths.ipc_socket_path, PathBuf::from("/var/tmp/vynl.sock"));
     }
@@ -315,6 +345,14 @@ mod tests {
         assert_eq!(
             paths.log_file,
             PathBuf::from("C:/Users/carol/AppData/Local/vynl/state/vynl.log")
+        );
+        assert_eq!(
+            paths.tokens_file(),
+            PathBuf::from("C:/Users/carol/AppData/Local/vynl/state/tokens.json")
+        );
+        assert_eq!(
+            paths.metadata_cache_file(),
+            PathBuf::from("C:/Users/carol/AppData/Local/vynl/cache/metadata.redb")
         );
         assert_eq!(paths.ipc_socket_path, PathBuf::from(r"\\.\pipe\vynl"));
     }

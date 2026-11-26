@@ -1,18 +1,23 @@
 //! Interactive TUI, CLI parser, and diagnostics for the `vynl` binary crate.
 
 pub mod app;
+pub mod auth;
 pub mod buffer;
 pub mod input;
 pub mod layout;
 pub mod render;
+pub mod spotify_worker;
+pub mod storage;
 
 use std::env;
 
-use vynl_core::config::AppConfig;
 use vynl_images::ImageProtocol;
 use vynl_player::CompiledPlayerFeatures;
+use vynl_spotify::AuthState;
 use vynl_system::paths::AppPaths;
 use vynl_system::{IpcCommand, ipc_transport_name, media_control_backend_name};
+
+use crate::auth::{AuthOptions, DEFAULT_AUTH_PORT};
 
 /// Parsed top-level CLI invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +27,8 @@ pub enum CliAction {
         /// Load built-in demo catalog with procedural album art.
         demo: bool,
     },
+    /// Run the interactive Spotify OAuth 2.0 PKCE login (or logout) workflow.
+    Auth(AuthOptions),
     /// Render a single demo TUI frame to stdout and exit (useful for testing & VHS demos).
     RenderDemo {
         /// Terminal width in columns.
@@ -53,6 +60,10 @@ where
     S: AsRef<str>,
 {
     let tokens: Vec<String> = args.into_iter().map(|s| s.as_ref().to_owned()).collect();
+    if tokens.first().map(String::as_str) == Some("auth") {
+        return parse_auth_args(&tokens[1..]).map(CliAction::Auth);
+    }
+
     match tokens.as_slice() {
         [] => Ok(CliAction::LaunchTui { demo: false }),
         [flag] if flag == "--demo" => Ok(CliAction::LaunchTui { demo: true }),
@@ -91,14 +102,71 @@ where
     }
 }
 
+fn parse_auth_args(args: &[String]) -> Result<AuthOptions, String> {
+    let mut opts = AuthOptions {
+        client_id: None,
+        port: DEFAULT_AUTH_PORT,
+        logout: false,
+    };
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "logout" | "--logout" => {
+                opts.logout = true;
+                i += 1;
+            }
+            "--client-id" => {
+                let Some(val) = args.get(i + 1) else {
+                    return Err(String::from("missing value for `--client-id`"));
+                };
+                if val.trim().is_empty() {
+                    return Err(String::from("`--client-id` cannot be empty"));
+                }
+                opts.client_id = Some(val.trim().to_owned());
+                i += 2;
+            }
+            "--port" => {
+                let Some(val) = args.get(i + 1) else {
+                    return Err(String::from("missing value for `--port`"));
+                };
+                let port: u16 = val
+                    .parse()
+                    .map_err(|_| format!("invalid port `{val}` (expected 1..=65535)"))?;
+                if port == 0 {
+                    return Err(String::from("`--port` must be between 1 and 65535"));
+                }
+                opts.port = port;
+                i += 2;
+            }
+            other => {
+                return Err(format!(
+                    "unknown `vynl auth` argument `{other}` — run `vynl --help` for usage"
+                ));
+            }
+        }
+    }
+
+    Ok(opts)
+}
+
 /// Detects the active terminal image protocol from the current process environment.
 #[must_use]
 pub fn detect_env_protocol() -> ImageProtocol {
+    resolve_env_protocol(vynl_core::config::ImageProtocolPreference::Auto)
+}
+
+/// Resolves the terminal image protocol honoring a configured [`vynl_core::config::ImageProtocolPreference`].
+#[must_use]
+pub fn resolve_env_protocol(
+    preference: vynl_core::config::ImageProtocolPreference,
+) -> ImageProtocol {
     let term_program = env::var("TERM_PROGRAM").ok();
     let term = env::var("TERM").ok();
     let kitty_window = env::var("KITTY_WINDOW_ID").ok();
     let in_tmux = env::var("TMUX").is_ok();
-    ImageProtocol::detect_from_env(
+    ImageProtocol::resolve(
+        preference,
         term_program.as_deref(),
         term.as_deref(),
         kitty_window.as_deref(),
@@ -109,16 +177,36 @@ pub fn detect_env_protocol() -> ImageProtocol {
 /// Formats the `vynl doctor` diagnostic report for bug reports and terminal verification.
 #[must_use]
 pub fn format_doctor_report() -> String {
-    let cfg = AppConfig::default();
-    let feats = CompiledPlayerFeatures::current();
     let paths = AppPaths::resolve();
+    let (cfg, cfg_status) = match storage::load_config(&paths) {
+        Ok(cfg) => (
+            cfg,
+            if paths.config_file().is_file() {
+                "loaded"
+            } else {
+                "defaults (not created yet)"
+            }
+            .to_owned(),
+        ),
+        Err(err) => (
+            vynl_core::config::AppConfig::default(),
+            format!("error ({err})"),
+        ),
+    };
+    let feats = CompiledPlayerFeatures::current();
     let term_program = env::var("TERM_PROGRAM").ok();
     let term = env::var("TERM").ok();
     let in_tmux = env::var("TMUX").is_ok();
 
-    let protocol = detect_env_protocol();
+    let protocol = resolve_env_protocol(cfg.images.protocol);
     let list_thumbs = protocol.render_list_thumbnails(cfg.images.list_thumbnails);
-    let auth_state = vynl_spotify::initial_auth_state(&cfg.spotify);
+    let has_tokens = matches!(storage::load_tokens(&paths), Ok(Some(_)));
+    let auth_state = if has_tokens && cfg.spotify.client_id.is_some() {
+        AuthState::Authenticated
+    } else {
+        vynl_spotify::initial_auth_state(&cfg.spotify)
+    };
+    let custom_themes = storage::discover_custom_themes(&paths);
 
     format!(
         "vynl {} (GPL-3.0-or-later)\n\
@@ -129,9 +217,12 @@ pub fn format_doctor_report() -> String {
          image protocol:    {} (list thumbnails: {})\n\
          audio backends:    rodio={}, subprocess={}, visualizer={}\n\
          spotify auth:      {auth_state:?} ({} OAuth scopes)\n\
+         active theme:      {} (custom themes: {})\n\
          media controls:    {}\n\
          ipc transport:     {} ({})\n\
-         config path:       {}\n\
+         config path:       {} ({cfg_status})\n\
+         themes dir:        {}\n\
+         metadata cache:    {}\n\
          image cache:       {}\n\
          policy:            strictly Spotify-only (no external third-party APIs)",
         env!("CARGO_PKG_VERSION"),
@@ -146,10 +237,14 @@ pub fn format_doctor_report() -> String {
         feats.subprocess,
         feats.visualizer,
         vynl_spotify::REQUIRED_SCOPES.len(),
+        cfg.ui.theme,
+        custom_themes.len(),
         media_control_backend_name(),
         ipc_transport_name(),
         paths.ipc_socket_path.display(),
         paths.config_file().display(),
+        paths.themes_dir.display(),
+        paths.metadata_cache_file().display(),
         paths.image_cache_dir.display(),
     )
 }
@@ -159,22 +254,26 @@ pub fn format_doctor_report() -> String {
 pub const fn usage_text() -> &'static str {
     "vynl — Cross-platform Rust TUI Spotify client with native terminal cover art\n\n\
      USAGE:\n  \
-       vynl                    Launch the interactive TUI\n  \
-       vynl --demo             Launch interactive TUI with built-in demo catalog & cover art\n  \
-       vynl --render-demo      Render one demo frame (add --plain for plain text)\n  \
-       vynl doctor             Print terminal image, path & platform diagnostics\n  \
-       vynl status [--json]    Print playback status from the running instance\n  \
-       vynl play-pause         Toggle playback via local IPC\n  \
-       vynl next | prev        Skip tracks via local IPC\n  \
-       vynl volume <+N|-N>     Adjust volume via local IPC\n  \
-       vynl open <URI>         Open a Spotify URI via local IPC\n  \
-       vynl --version          Print version\n  \
-       vynl --help             Show this help message"
+       vynl                                      Launch the interactive TUI\n  \
+       vynl --demo                               Launch TUI with built-in demo catalog & cover art\n  \
+       vynl auth [--client-id ID] [--port PORT]  Authenticate with Spotify via OAuth 2.0 PKCE\n  \
+       vynl auth logout                          Clear stored Spotify OAuth tokens\n  \
+       vynl --render-demo                        Render one demo frame (add --plain for plain text)\n  \
+       vynl doctor                               Print terminal image, path & platform diagnostics\n  \
+       vynl status [--json]                      Print playback status from the running instance\n  \
+       vynl play-pause                           Toggle playback via local IPC\n  \
+       vynl next | prev                          Skip tracks via local IPC\n  \
+       vynl volume <+N|-N>                       Adjust volume via local IPC\n  \
+       vynl open <URI>                           Open a Spotify URI via local IPC\n  \
+       vynl --version                            Print version\n  \
+       vynl --help                               Show this help message"
 }
 
 #[cfg(test)]
 mod tests {
     use vynl_system::IpcCommand;
+
+    use crate::auth::{AuthOptions, DEFAULT_AUTH_PORT};
 
     use super::{CliAction, format_doctor_report, parse_args};
 
@@ -188,6 +287,27 @@ mod tests {
             parse_args(["--demo"]),
             Ok(CliAction::LaunchTui { demo: true })
         );
+        assert_eq!(
+            parse_args(["auth"]),
+            Ok(CliAction::Auth(AuthOptions::default()))
+        );
+        assert_eq!(
+            parse_args(["auth", "--client-id", "abc123", "--port", "9000"]),
+            Ok(CliAction::Auth(AuthOptions {
+                client_id: Some(String::from("abc123")),
+                port: 9000,
+                logout: false,
+            }))
+        );
+        assert_eq!(
+            parse_args(["auth", "logout"]),
+            Ok(CliAction::Auth(AuthOptions {
+                client_id: None,
+                port: DEFAULT_AUTH_PORT,
+                logout: true,
+            }))
+        );
+        assert!(parse_args(["auth", "--port", "0"]).is_err());
         assert_eq!(parse_args(["doctor"]), Ok(CliAction::Doctor));
         assert_eq!(
             parse_args(["status", "--json"]),
@@ -211,5 +331,7 @@ mod tests {
         assert!(report.contains("image protocol:"));
         assert!(report.contains("strictly Spotify-only"));
         assert!(report.contains("config path:"));
+        assert!(report.contains("themes dir:"));
+        assert!(report.contains("metadata cache:"));
     }
 }

@@ -1,44 +1,54 @@
-//! Terminal raw-mode guard, panic-safe restoration hook, and VT100 / SGR-1006
-//! keyboard & mouse input parser (`#[forbid(unsafe_code)]`).
+//! Cross-platform terminal raw-mode guard (`crossterm`), panic-safe restoration hook,
+//! and keyboard/mouse input decoding (`#[forbid(unsafe_code)]`).
 
 use std::io::{self, Write};
-use std::process::Command;
+use std::time::Duration;
 
+use crossterm::cursor::{Hide, Show};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode as CtKeyCode,
+    KeyEvent as CtKeyEvent, KeyEventKind, KeyModifiers as CtKeyModifiers,
+    MouseButton as CtMouseButton, MouseEvent as CtMouseEvent, MouseEventKind as CtMouseEventKind,
+};
+use crossterm::execute;
+use crossterm::terminal::{
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use vynl_core::keymap::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
-/// High-level terminal input event decoded from stdin bytes.
+/// High-level terminal input event decoded from `crossterm` or raw VT100 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalInput {
     /// Keyboard press.
     Key(KeyEvent),
-    /// SGR mouse interaction.
+    /// Mouse interaction.
     Mouse(MouseEvent),
+    /// Terminal resized to `(cols, rows)`.
+    Resize(u16, u16),
 }
 
 /// Restores terminal state cleanly even if the application panics.
 pub fn restore_terminal_state() {
+    let _ = disable_raw_mode();
     let mut stdout = io::stdout();
-    // Disable SGR mouse tracking, show cursor, leave alternate screen, reset SGR.
-    let _ = stdout.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25h\x1b[?1049l\x1b[0m");
+    let _ = execute!(stdout, DisableMouseCapture, Show, LeaveAlternateScreen);
+    let _ = stdout.write_all(b"\x1b[0m");
     let _ = stdout.flush();
-    #[cfg(unix)]
-    {
-        let _ = Command::new("stty").arg("sane").status();
-    }
 }
 
-/// RAII guard owning alternate screen, raw mode, mouse tracking, and panic hook.
+/// RAII guard owning native `crossterm` alternate screen, raw mode, mouse capture,
+/// and panic-safe terminal restoration hook across Linux, macOS, and Windows.
 #[derive(Debug)]
 pub struct TerminalGuard {
     active: bool,
 }
 
 impl TerminalGuard {
-    /// Enters alternate screen, raw mode, and optional SGR mouse capture,
+    /// Enters alternate screen, raw mode, and optional mouse capture,
     /// installing a panic hook that always restores the user's terminal.
     ///
     /// # Errors
-    /// Returns an I/O error if writing terminal setup sequences fails.
+    /// Returns an I/O error if enabling raw mode or writing terminal setup sequences fails.
     pub fn enter(mouse_enabled: bool) -> io::Result<Self> {
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -46,15 +56,11 @@ impl TerminalGuard {
             prev_hook(info);
         }));
 
-        #[cfg(unix)]
-        {
-            let _ = Command::new("stty").args(["raw", "-echo"]).status();
-        }
-
+        enable_raw_mode()?;
         let mut stdout = io::stdout();
-        stdout.write_all(b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")?;
+        execute!(stdout, EnterAlternateScreen, Hide, Clear(ClearType::All))?;
         if mouse_enabled {
-            stdout.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h")?;
+            execute!(stdout, EnableMouseCapture)?;
         }
         stdout.flush()?;
 
@@ -71,23 +77,15 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Queries current terminal dimensions `(cols, rows)` via `stty size` or `$COLUMNS`/`$LINES`,
-/// falling back to `(140, 40)`.
+/// Queries current terminal dimensions `(cols, rows)` natively via `crossterm::terminal::size`,
+/// falling back to `$COLUMNS`/`$LINES` or `(140, 40)` when detached from a TTY.
 #[must_use]
 pub fn query_terminal_size() -> (u16, u16) {
-    #[cfg(unix)]
-    if let Ok(output) = Command::new("stty").arg("size").output()
-        && output.status.success()
-        && let Ok(text) = String::from_utf8(output.stdout)
+    if let Ok((cols, rows)) = crossterm::terminal::size()
+        && cols > 0
+        && rows > 0
     {
-        let mut parts = text.split_whitespace();
-        if let (Some(rows_s), Some(cols_s)) = (parts.next(), parts.next())
-            && let (Ok(rows), Ok(cols)) = (rows_s.parse::<u16>(), cols_s.parse::<u16>())
-            && cols > 0
-            && rows > 0
-        {
-            return (cols, rows);
-        }
+        return (cols, rows);
     }
 
     let cols = std::env::var("COLUMNS")
@@ -103,7 +101,89 @@ pub fn query_terminal_size() -> (u16, u16) {
     (cols, rows)
 }
 
-/// Parses a chunk of raw stdin bytes into one or more [`TerminalInput`] events.
+/// Polls for the next native `crossterm` terminal event up to `timeout`.
+///
+/// # Errors
+/// Returns an I/O error if polling or reading from the terminal fails.
+pub fn poll_terminal_event(timeout: Duration) -> io::Result<Option<TerminalInput>> {
+    if !event::poll(timeout)? {
+        return Ok(None);
+    }
+    let raw = event::read()?;
+    Ok(from_crossterm_event(&raw))
+}
+
+/// Translates a native [`crossterm::event::Event`] into a [`TerminalInput`].
+///
+/// Filters out key release events so Windows terminals never double-fire bindings.
+#[must_use]
+pub fn from_crossterm_event(event: &Event) -> Option<TerminalInput> {
+    match event {
+        Event::Key(key) => from_crossterm_key(*key).map(TerminalInput::Key),
+        Event::Mouse(mouse) => from_crossterm_mouse(*mouse).map(TerminalInput::Mouse),
+        Event::Resize(cols, rows) => Some(TerminalInput::Resize(*cols, *rows)),
+        Event::FocusGained | Event::FocusLost | Event::Paste(_) => None,
+    }
+}
+
+fn from_crossterm_key(key: CtKeyEvent) -> Option<KeyEvent> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+
+    let code = match key.code {
+        CtKeyCode::Char(c) => KeyCode::Char(c),
+        CtKeyCode::Enter => KeyCode::Enter,
+        CtKeyCode::Esc => KeyCode::Esc,
+        CtKeyCode::Backspace => KeyCode::Backspace,
+        CtKeyCode::Tab => KeyCode::Tab,
+        CtKeyCode::BackTab => KeyCode::BackTab,
+        CtKeyCode::Up => KeyCode::Up,
+        CtKeyCode::Down => KeyCode::Down,
+        CtKeyCode::Left => KeyCode::Left,
+        CtKeyCode::Right => KeyCode::Right,
+        CtKeyCode::Home => KeyCode::Home,
+        CtKeyCode::End => KeyCode::End,
+        _ => return None,
+    };
+
+    let modifiers = KeyModifiers {
+        ctrl: key.modifiers.contains(CtKeyModifiers::CONTROL),
+        alt: key.modifiers.contains(CtKeyModifiers::ALT),
+        shift: key.modifiers.contains(CtKeyModifiers::SHIFT),
+    };
+
+    Some(KeyEvent { code, modifiers })
+}
+
+const fn from_crossterm_mouse(mouse: CtMouseEvent) -> Option<MouseEvent> {
+    let kind = match mouse.kind {
+        CtMouseEventKind::Down(btn) => MouseEventKind::Down(from_crossterm_button(btn)),
+        CtMouseEventKind::Up(btn) => MouseEventKind::Up(from_crossterm_button(btn)),
+        CtMouseEventKind::Drag(btn) => MouseEventKind::Drag(from_crossterm_button(btn)),
+        CtMouseEventKind::ScrollUp => MouseEventKind::ScrollUp,
+        CtMouseEventKind::ScrollDown => MouseEventKind::ScrollDown,
+        CtMouseEventKind::Moved | CtMouseEventKind::ScrollLeft | CtMouseEventKind::ScrollRight => {
+            return None;
+        }
+    };
+
+    Some(MouseEvent {
+        kind,
+        col: mouse.column,
+        row: mouse.row,
+    })
+}
+
+const fn from_crossterm_button(btn: CtMouseButton) -> MouseButton {
+    match btn {
+        CtMouseButton::Left => MouseButton::Left,
+        CtMouseButton::Right => MouseButton::Right,
+        CtMouseButton::Middle => MouseButton::Middle,
+    }
+}
+
+/// Parses a chunk of raw VT100/SGR-1006 stdin bytes into [`TerminalInput`] events.
 #[must_use]
 pub fn parse_input_bytes(bytes: &[u8]) -> Vec<TerminalInput> {
     let mut events = Vec::new();
@@ -127,7 +207,6 @@ pub fn parse_input_bytes(bytes: &[u8]) -> Vec<TerminalInput> {
                 i += 1;
                 continue;
             }
-            // Alt + char
             let ch = char::from(bytes[i + 1]);
             events.push(TerminalInput::Key(KeyEvent::alt(KeyCode::Char(ch))));
             i += 2;
@@ -161,7 +240,6 @@ fn parse_csi(rest: &[u8]) -> Option<(TerminalInput, usize)> {
         return None;
     }
 
-    // SGR Mouse sequence: `<btn;col;rowM` or `<btn;col;rowm`
     if rest[0] == b'<' {
         let end = rest.iter().position(|&c| c == b'M' || c == b'm')?;
         let body = std::str::from_utf8(&rest[1..end]).ok()?;
@@ -184,7 +262,6 @@ fn parse_csi(rest: &[u8]) -> Option<(TerminalInput, usize)> {
         return Some((TerminalInput::Mouse(MouseEvent { kind, col, row }), end + 1));
     }
 
-    // Modified arrows: `1;2C` (Shift+Right), `1;3D` (Alt+Left), etc.
     if rest.len() >= 4 && rest[0] == b'1' && rest[1] == b';' {
         let mod_digit = rest[2];
         let dir = rest[3];
@@ -236,11 +313,16 @@ const fn button_from_bits(bits: u16) -> MouseButton {
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::{
+        Event, KeyCode as CtKeyCode, KeyEvent as CtKeyEvent, KeyEventKind, KeyEventState,
+        KeyModifiers as CtKeyModifiers, MouseButton as CtMouseButton, MouseEvent as CtMouseEvent,
+        MouseEventKind as CtMouseEventKind,
+    };
     use vynl_core::keymap::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
 
-    use super::{TerminalInput, parse_input_bytes};
+    use super::{TerminalInput, from_crossterm_event, parse_input_bytes};
 
     #[test]
     fn parses_arrows_ctrl_and_sgr_mouse_sequences() {
@@ -274,6 +356,48 @@ mod tests {
                     row: 4,
                 }),
             ]
+        );
+    }
+
+    #[test]
+    fn translates_crossterm_key_mouse_and_resize_events_and_filters_releases() {
+        let press = Event::Key(CtKeyEvent {
+            code: CtKeyCode::Char('p'),
+            modifiers: CtKeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        assert_eq!(
+            from_crossterm_event(&press),
+            Some(TerminalInput::Key(KeyEvent::ctrl('p')))
+        );
+
+        let release = Event::Key(CtKeyEvent {
+            code: CtKeyCode::Char('p'),
+            modifiers: CtKeyModifiers::CONTROL,
+            kind: KeyEventKind::Release,
+            state: KeyEventState::NONE,
+        });
+        assert_eq!(from_crossterm_event(&release), None);
+
+        let mouse = Event::Mouse(CtMouseEvent {
+            kind: CtMouseEventKind::Down(CtMouseButton::Left),
+            column: 12,
+            row: 5,
+            modifiers: CtKeyModifiers::NONE,
+        });
+        assert_eq!(
+            from_crossterm_event(&mouse),
+            Some(TerminalInput::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                col: 12,
+                row: 5,
+            }))
+        );
+
+        assert_eq!(
+            from_crossterm_event(&Event::Resize(160, 48)),
+            Some(TerminalInput::Resize(160, 48))
         );
     }
 }

@@ -1,6 +1,8 @@
 //! Full desktop-parity TUI frame renderer with terminal cover art,
 //! **Modal-Aware Image Occlusion**, adaptive cover accents, and responsive breakpoints.
 
+use std::collections::HashSet;
+
 use vynl_core::fuzzy::rank_items;
 use vynl_core::model::{SearchCategory, TrackSummary, format_duration_ms};
 use vynl_core::state::{
@@ -8,8 +10,8 @@ use vynl_core::state::{
 };
 use vynl_core::theme::{Rgb, Theme};
 use vynl_images::{
-    CellRect, EncodedImage, ImageCacheKey, ImageProtocol, L1ImageCache, OcclusionTracker,
-    encode_for_protocol, generate_demo_cover,
+    CellRect, EncodedImage, ImageCacheKey, ImagePriority, ImageProtocol, ImageRequest, ImageWorker,
+    L1ImageCache, OcclusionTracker, encode_for_protocol, generate_demo_cover,
 };
 
 use crate::buffer::{Buffer, CellStyle, Rect};
@@ -24,6 +26,17 @@ pub struct PaletteCommand {
     pub label: &'static str,
     /// Shortcut hint displayed on the right.
     pub shortcut: &'static str,
+}
+
+/// Owned Command Palette entry combining built-ins and dynamically discovered user themes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicPaletteEntry {
+    /// Unique action identifier (custom themes use `theme_custom:<name>`).
+    pub id: String,
+    /// Human-readable English label shown in the Command Palette.
+    pub label: String,
+    /// Shortcut hint displayed on the right.
+    pub shortcut: String,
 }
 
 /// Complete list of searchable Command Palette actions.
@@ -130,7 +143,7 @@ pub const PALETTE_COMMANDS: &[PaletteCommand] = &[
     },
 ];
 
-/// Returns Command Palette entries ranked by fuzzy score for `query`.
+/// Returns built-in Command Palette entries ranked by fuzzy score for `query`.
 #[must_use]
 pub fn filter_palette_commands(query: &str) -> Vec<&'static PaletteCommand> {
     if query.trim().is_empty() {
@@ -139,6 +152,39 @@ pub fn filter_palette_commands(query: &str) -> Vec<&'static PaletteCommand> {
     rank_items(query, PALETTE_COMMANDS, |cmd| cmd.label.to_owned())
         .into_iter()
         .filter_map(|(idx, _)| PALETTE_COMMANDS.get(idx))
+        .collect()
+}
+
+/// Returns all Command Palette entries (built-ins plus custom `~/.config/vynl/themes/*.toml`
+/// themes) ranked by fuzzy score for `query`.
+#[must_use]
+pub fn filter_palette_entries(query: &str, custom_themes: &[String]) -> Vec<DynamicPaletteEntry> {
+    let mut entries: Vec<DynamicPaletteEntry> = PALETTE_COMMANDS
+        .iter()
+        .map(|cmd| DynamicPaletteEntry {
+            id: cmd.id.to_owned(),
+            label: cmd.label.to_owned(),
+            shortcut: cmd.shortcut.to_owned(),
+        })
+        .collect();
+
+    for name in custom_themes {
+        if Theme::builtin(name).is_none() {
+            entries.push(DynamicPaletteEntry {
+                id: format!("theme_custom:{name}"),
+                label: format!("Theme: Switch to {name} (custom)"),
+                shortcut: String::new(),
+            });
+        }
+    }
+
+    if query.trim().is_empty() {
+        return entries;
+    }
+
+    rank_items(query, &entries, |cmd| cmd.label.clone())
+        .into_iter()
+        .filter_map(|(idx, _)| entries.get(idx).cloned())
         .collect()
 }
 
@@ -156,10 +202,18 @@ pub struct RenderContext<'a> {
     pub view_tracks: &'a [TrackSummary],
     /// Optional FFT spectrum bars (`0.0..=1.0`) for Zen mode.
     pub spectrum_bars: &'a [f32],
+    /// Custom theme names discovered under `~/.config/vynl/themes/*.toml`.
+    pub custom_themes: &'a [String],
     /// L1 decoded image cache (mutated on synchronous demo fills).
     pub l1_cache: &'a mut L1ImageCache,
     /// Per-frame Modal-Aware Image Occlusion tracker.
     pub occlusion: &'a mut OcclusionTracker,
+    /// Optional background worker for non-blocking remote HTTP cover fetching & decoding.
+    pub image_worker: Option<&'a ImageWorker>,
+    /// In-flight remote cover requests so we do not enqueue duplicates per frame.
+    pub pending_images: &'a mut HashSet<ImageCacheKey>,
+    /// Monotonic request ID generator for [`ImageRequest`]s.
+    pub next_image_req_id: &'a mut u64,
 }
 
 /// Renders a complete frame of `vynl` into a [`Buffer`].
@@ -197,7 +251,14 @@ pub fn render_frame(cols: u16, rows: u16, ctx: &mut RenderContext<'_>) -> Buffer
     }
 
     if let (Some(modal), Some(rect)) = (&ctx.state.modal, modal_rect) {
-        render_modal(&mut buf, rect, modal, ctx.state, ctx.theme);
+        render_modal(
+            &mut buf,
+            rect,
+            modal,
+            ctx.state,
+            ctx.theme,
+            ctx.custom_themes,
+        );
     }
 
     buf
@@ -1172,6 +1233,7 @@ fn render_modal(
     modal: &ActiveModal,
     state: &AppState,
     theme: &Theme,
+    custom_themes: &[String],
 ) {
     let fill = CellStyle::fg_bg(theme.text_primary, theme.surface);
     let accent = CellStyle::fg_bg(theme.accent, theme.surface).bold();
@@ -1205,7 +1267,7 @@ fn render_modal(
                 inner.width,
                 accent,
             );
-            let matches = filter_palette_commands(query);
+            let matches = filter_palette_entries(query, custom_themes);
             for (i, cmd) in matches.iter().enumerate() {
                 let Ok(off) = u16::try_from(i + 2) else {
                     break;
@@ -1219,7 +1281,7 @@ fn render_modal(
                     fill
                 };
                 let row = if cmd.shortcut.is_empty() {
-                    cmd.label.to_owned()
+                    cmd.label.clone()
                 } else {
                     format!("{}  [{}]", cmd.label, cmd.shortcut)
                 };
@@ -1368,10 +1430,37 @@ fn render_cover_slot(
     }
 
     let key = ImageCacheKey::new(url, rect.width, rect.height, ctx.protocol);
+    let is_remote_url = url.starts_with("https://") || url.starts_with("http://");
+
     let encoded = if let Some(cached) = ctx.l1_cache.get(&key) {
         cached.encoded.clone()
+    } else if is_remote_url && let Some(worker) = ctx.image_worker {
+        // Non-blocking remote cover pipeline: enqueue download/decode on ImageWorker
+        // and show a lightweight procedural placeholder without poisoning L1 cache.
+        if ctx.pending_images.insert(key.clone()) {
+            let req_id = *ctx.next_image_req_id;
+            *ctx.next_image_req_id = ctx.next_image_req_id.saturating_add(1);
+            let _ = worker.submit(ImageRequest {
+                id: req_id,
+                viewport_epoch: worker.current_viewport(),
+                url: url.to_owned(),
+                cols: rect.width,
+                rows: rect.height,
+                cell_px_w: 8,
+                cell_px_h: 16,
+                protocol: ctx.protocol,
+                priority: if slot_id.contains("now") || slot_id.contains("zen") {
+                    ImagePriority::High
+                } else {
+                    ImagePriority::Normal
+                },
+                palette_colors: 4,
+            });
+        }
+        let placeholder = generate_demo_cover(url, 32);
+        encode_for_protocol(&placeholder, ctx.protocol, rect.width, rect.height, 8, 16)
     } else {
-        // Procedural cover fallback (used in --demo and while remote covers load)
+        // Procedural cover fallback (used in --demo and headless snapshot tests)
         let img = generate_demo_cover(url, 64);
         let palette = img.extract_dominant_palette(3);
         let enc = encode_for_protocol(&img, ctx.protocol, rect.width, rect.height, 8, 16);
@@ -1386,28 +1475,63 @@ fn render_cover_slot(
     };
 
     match encoded {
-        EncodedImage::Halfblocks(_) => {
-            // Write crisp 24-bit TrueColor halfblock (`▀`) cells directly into the diff buffer!
-            let img = generate_demo_cover(url, 64);
-            let px_h = u32::from(rect.height).saturating_mul(2).max(2);
-            let px_w = u32::from(rect.width).max(1);
-            let scaled = img.resize_bilinear(px_w, px_h);
-            for r in 0..rect.height {
-                for c in 0..rect.width {
-                    let top_y = u32::from(r) * 2;
-                    let bot_y = (top_y + 1).min(scaled.height.saturating_sub(1));
-                    let x = u32::from(c).min(scaled.width.saturating_sub(1));
-                    let top = scaled.get_pixel(x, top_y).unwrap_or(Rgb::new(30, 30, 30));
-                    let bot = scaled.get_pixel(x, bot_y).unwrap_or(Rgb::new(18, 18, 18));
-                    let style = CellStyle::fg_bg(top, bot);
-                    buf.set(rect.x + c, rect.y + r, '▀', style);
-                }
-            }
+        EncodedImage::Halfblocks(rows) => {
+            blit_halfblock_rows(buf, rect, &rows);
         }
         EncodedImage::Kitty(seq) | EncodedImage::ITerm2(seq) | EncodedImage::Sixel(seq) => {
             buf.push_graphics_overlay(rect.x, rect.y, seq);
         }
     }
+}
+
+fn blit_halfblock_rows(buf: &mut Buffer, rect: Rect, rows: &[String]) {
+    let mut active_style = CellStyle::fg_bg(Rgb::new(30, 30, 30), Rgb::new(18, 18, 18));
+    for (r_idx, row_str) in rows.iter().enumerate() {
+        let Ok(r) = u16::try_from(r_idx) else {
+            break;
+        };
+        if r >= rect.height {
+            break;
+        }
+        let mut col = 0u16;
+        let mut remaining = row_str.as_str();
+        while !remaining.is_empty() && col < rect.width {
+            if let Some(after_esc) = remaining.strip_prefix("\x1b[") {
+                if let Some(m_pos) = after_esc.find('m') {
+                    let params = &after_esc[..m_pos];
+                    if let Some(style) = parse_halfblock_sgr(params) {
+                        active_style = style;
+                    }
+                    remaining = &after_esc[m_pos + 1..];
+                    continue;
+                }
+                break;
+            }
+            let Some(ch) = remaining.chars().next() else {
+                break;
+            };
+            buf.set(rect.x + col, rect.y + r, ch, active_style);
+            col = col.saturating_add(1);
+            remaining = &remaining[ch.len_utf8()..];
+        }
+    }
+}
+
+fn parse_halfblock_sgr(params: &str) -> Option<CellStyle> {
+    let mut parts = params.split(';');
+    if parts.next()? != "38" || parts.next()? != "2" {
+        return None;
+    }
+    let tr: u8 = parts.next()?.parse().ok()?;
+    let tg: u8 = parts.next()?.parse().ok()?;
+    let tb: u8 = parts.next()?.parse().ok()?;
+    if parts.next()? != "48" || parts.next()? != "2" {
+        return None;
+    }
+    let br: u8 = parts.next()?.parse().ok()?;
+    let bg: u8 = parts.next()?.parse().ok()?;
+    let bb: u8 = parts.next()?.parse().ok()?;
+    Some(CellStyle::fg_bg(Rgb::new(tr, tg, tb), Rgb::new(br, bg, bb)))
 }
 
 fn truncate_chars(s: &str, max_chars: usize) -> String {

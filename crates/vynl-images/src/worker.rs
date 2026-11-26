@@ -3,6 +3,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
+use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
@@ -88,6 +89,12 @@ pub trait ImageSource: Send + Sync + 'static {
     fn load(&self, url: &str) -> Result<RgbImage, String>;
 }
 
+/// Default maximum encoded image payload size accepted over HTTP (10 MiB).
+pub const DEFAULT_MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Default HTTP timeout for remote cover-art downloads.
+pub const DEFAULT_IMAGE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Offline procedural cover-art [`ImageSource`] backed by [`generate_demo_cover`].
 #[derive(Debug, Clone, Copy)]
 pub struct DemoImageSource {
@@ -104,6 +111,97 @@ impl Default for DemoImageSource {
 impl ImageSource for DemoImageSource {
     fn load(&self, url: &str) -> Result<RgbImage, String> {
         Ok(generate_demo_cover(url, self.cover_size))
+    }
+}
+
+/// HTTP/HTTPS [`ImageSource`] backed by `reqwest::blocking::Client` (`rustls-tls`)
+/// with bounded payload reads and deterministic fallback for `demo://` and `spotify:` URIs.
+#[derive(Debug, Clone)]
+pub struct HttpImageSource {
+    client: reqwest::blocking::Client,
+    max_bytes: usize,
+    demo_fallback: DemoImageSource,
+}
+
+impl HttpImageSource {
+    /// Creates an [`HttpImageSource`] using [`DEFAULT_IMAGE_TIMEOUT`] and
+    /// [`DEFAULT_MAX_IMAGE_BYTES`].
+    ///
+    /// # Errors
+    /// Returns an error if the underlying HTTP client cannot be constructed.
+    pub fn new() -> Result<Self, String> {
+        Self::with_timeout_and_limit(DEFAULT_IMAGE_TIMEOUT, DEFAULT_MAX_IMAGE_BYTES)
+    }
+
+    /// Creates an [`HttpImageSource`] with a custom request `timeout` and maximum
+    /// response payload size `max_bytes`.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying HTTP client cannot be constructed.
+    pub fn with_timeout_and_limit(timeout: Duration, max_bytes: usize) -> Result<Self, String> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .user_agent(concat!("vynl/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|err| format!("failed to build HTTP image client: {err}"))?;
+
+        Ok(Self {
+            client,
+            max_bytes,
+            demo_fallback: DemoImageSource::default(),
+        })
+    }
+}
+
+impl ImageSource for HttpImageSource {
+    fn load(&self, url: &str) -> Result<RgbImage, String> {
+        if url.starts_with("demo://") || url.starts_with("spotify:") {
+            return self.demo_fallback.load(url);
+        }
+
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            return Err(format!("unsupported image URL scheme: `{url}`"));
+        }
+
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .map_err(|err| format!("failed to fetch image from `{url}`: {err}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!(
+                "image request for `{url}` failed with HTTP status {}",
+                status.as_u16()
+            ));
+        }
+
+        let max_bytes_u64 = u64::try_from(self.max_bytes).unwrap_or(u64::MAX);
+        if response
+            .content_length()
+            .is_some_and(|declared| declared > max_bytes_u64)
+        {
+            return Err(format!(
+                "image payload from `{url}` exceeds maximum allowed size of {} bytes",
+                self.max_bytes
+            ));
+        }
+
+        let mut buf = Vec::new();
+        let read_limit = max_bytes_u64.saturating_add(1);
+        std::io::Read::take(response, read_limit)
+            .read_to_end(&mut buf)
+            .map_err(|err| format!("failed to read image response from `{url}`: {err}"))?;
+
+        if buf.len() > self.max_bytes {
+            return Err(format!(
+                "image payload from `{url}` exceeds maximum allowed size of {} bytes",
+                self.max_bytes
+            ));
+        }
+
+        RgbImage::decode_encoded(&buf)
     }
 }
 
@@ -543,6 +641,131 @@ mod tests {
         assert!(matches!(ready.encoded, EncodedImage::ITerm2(ref s) if !s.is_empty()));
 
         worker.shutdown();
+        Ok(())
+    }
+
+    fn spawn_single_response_server(
+        response: Vec<u8>,
+    ) -> Result<(std::net::SocketAddr, std::thread::JoinHandle<()>), String> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .map_err(|err| format!("failed to bind loopback test server: {err}"))?;
+        let addr = listener
+            .local_addr()
+            .map_err(|err| format!("failed to read loopback server address: {err}"))?;
+
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut req_buf = [0u8; 1024];
+                let _ = stream.read(&mut req_buf);
+                let _ = stream.write_all(&response);
+                let _ = stream.flush();
+            }
+        });
+        Ok((addr, handle))
+    }
+
+    #[test]
+    fn http_image_source_delegates_demo_and_spotify_and_rejects_unknown_schemes()
+    -> Result<(), String> {
+        use super::{DemoImageSource, HttpImageSource, ImageSource};
+
+        let source = HttpImageSource::new()?;
+        let demo_expected = DemoImageSource::default().load("demo://album/sunset")?;
+        let demo_actual = source.load("demo://album/sunset")?;
+        assert_eq!(demo_actual, demo_expected);
+
+        let spotify_expected = DemoImageSource::default().load("spotify:album:abc123")?;
+        let spotify_actual = source.load("spotify:album:abc123")?;
+        assert_eq!(spotify_actual, spotify_expected);
+
+        assert!(source.load("ftp://example.com/cover.png").is_err());
+        assert!(source.load("file:///tmp/cover.png").is_err());
+        assert!(source.load("").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn http_image_source_loads_real_png_from_loopback_server_and_handles_http_errors()
+    -> Result<(), String> {
+        use std::io::Cursor;
+        use vynl_core::theme::Rgb;
+
+        use super::{HttpImageSource, ImageSource};
+
+        let mut raw_img = image::RgbImage::new(3, 2);
+        raw_img.put_pixel(0, 0, image::Rgb([15, 30, 45]));
+        raw_img.put_pixel(1, 0, image::Rgb([60, 75, 90]));
+        raw_img.put_pixel(2, 0, image::Rgb([105, 120, 135]));
+        raw_img.put_pixel(0, 1, image::Rgb([150, 165, 180]));
+        raw_img.put_pixel(1, 1, image::Rgb([195, 210, 225]));
+        raw_img.put_pixel(2, 1, image::Rgb([240, 250, 255]));
+
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(raw_img)
+            .write_to(&mut Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+            .map_err(|err| format!("failed to encode test PNG: {err}"))?;
+
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            png_bytes.len()
+        );
+        let mut ok_response = header.into_bytes();
+        ok_response.extend_from_slice(&png_bytes);
+
+        let (addr, handle) = spawn_single_response_server(ok_response)?;
+        let source = HttpImageSource::new()?;
+        let decoded = source.load(&format!("http://{addr}/cover.png"))?;
+        let _ = handle.join();
+
+        assert_eq!(decoded.width, 3);
+        assert_eq!(decoded.height, 2);
+        assert_eq!(decoded.get_pixel(0, 0), Some(Rgb::new(15, 30, 45)));
+        assert_eq!(decoded.get_pixel(2, 1), Some(Rgb::new(240, 250, 255)));
+
+        // Non-2xx status must return an error.
+        let not_found =
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found"
+                .to_vec();
+        let (addr_404, handle_404) = spawn_single_response_server(not_found)?;
+        let err = source.load(&format!("http://{addr_404}/missing.png"));
+        let _ = handle_404.join();
+        assert!(err.is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn http_image_source_rejects_oversized_payloads() -> Result<(), String> {
+        use super::{HttpImageSource, ImageSource};
+
+        let limited = HttpImageSource::with_timeout_and_limit(Duration::from_secs(5), 32)?;
+
+        // Case 1: Declared Content-Length exceeds limit.
+        let oversized_body = [0xAAu8; 64];
+        let mut declared_resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            oversized_body.len()
+        )
+        .into_bytes();
+        declared_resp.extend_from_slice(&oversized_body);
+        let (addr_declared, handle_declared) = spawn_single_response_server(declared_resp)?;
+        let res_declared = limited.load(&format!("http://{addr_declared}/too-big-header"));
+        let _ = handle_declared.join();
+        assert!(res_declared.is_err());
+
+        // Case 2: No Content-Length header; Read::take caps bytes read and rejects cleanly.
+        let mut streamed_resp =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n"
+                .to_vec();
+        streamed_resp.extend_from_slice(&[0xBBu8; 128]);
+        let (addr_streamed, handle_streamed) = spawn_single_response_server(streamed_resp)?;
+        let res_streamed = limited.load(&format!("http://{addr_streamed}/too-big-stream"));
+        let _ = handle_streamed.join();
+        assert!(res_streamed.is_err());
+
         Ok(())
     }
 }
