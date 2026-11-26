@@ -736,6 +736,21 @@ impl TokenBundle {
         })
     }
 
+    /// Serializes this token bundle into a canonical JSON string.
+    #[must_use]
+    pub fn to_json_string(&self) -> String {
+        to_json_string(&self.to_json())
+    }
+
+    /// Deserializes a persisted [`TokenBundle`] directly from a JSON string.
+    ///
+    /// # Errors
+    /// Returns an error if `raw` is malformed JSON or lacks required token fields.
+    pub fn from_json_str(raw: &str) -> Result<Self, String> {
+        let parsed = parse_json(raw)?;
+        Self::from_json(&parsed)
+    }
+
     /// Parses a Spotify `/api/token` JSON response into a [`TokenBundle`].
     ///
     /// # Errors
@@ -1051,6 +1066,22 @@ mod tests {
         store.clear()?;
         assert_eq!(store.load()?, None);
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn token_bundle_json_string_helpers_round_trip_and_validate() -> Result<(), String> {
+        let bundle = TokenBundle {
+            access_token: String::from("BQA-json-access"),
+            refresh_token: String::from("AQD-json-refresh"),
+            expires_at_epoch_secs: 1_950_000_000,
+        };
+        let encoded = bundle.to_json_string();
+        let decoded = TokenBundle::from_json_str(&encoded)?;
+        assert_eq!(decoded, bundle);
+
+        assert!(TokenBundle::from_json_str("not json").is_err());
+        assert!(TokenBundle::from_json_str(r#"{"access_token":""}"#).is_err());
         Ok(())
     }
 }

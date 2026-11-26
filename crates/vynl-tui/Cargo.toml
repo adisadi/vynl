@@ -25,6 +25,7 @@ vynl-images.workspace = true
 vynl-player = { workspace = true, default-features = false }
 vynl-spotify.workspace = true
 vynl-system.workspace = true
+crossterm.workspace = true
 
 [lints]
 workspace = true

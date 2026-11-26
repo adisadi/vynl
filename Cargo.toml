@@ -25,29 +25,19 @@ vynl-player = { version = "0.1.0", path = "crates/vynl-player" }
 vynl-images = { version = "0.1.0", path = "crates/vynl-images" }
 vynl-system = { version = "0.1.0", path = "crates/vynl-system" }
 
-# Phase 1+ external crates (Pure-Rust & Cross-Compile-First; uncomment as each phase lands):
-# ratatui = "0.29"
-# crossterm = "0.28"
-# ratatui-image = "4"
-# image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
-# tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
-# reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
-# serde = { version = "1", features = ["derive"] }
-# serde_json = "1"
-# toml = "0.8"
-# redb = "2"
-# nucleo = "0.5"
-# clap = { version = "4", features = ["derive"] }
-# directories = "6"
-# tracing = "0.1"
-# tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
-# librespot-core = "0.6"
-# librespot-playback = { version = "0.6", default-features = false }
-# librespot-connect = "0.6"
-# souvlaki = "0.8"
-# notify-rust = { version = "4", default-features = false, features = ["z"] }
-# rustfft = "6"
+# Phase 2+ external crates (Pure-Rust & Cross-Compile-First; zero openssl-sys / libsqlite3-sys):
+crossterm = "0.28"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "gzip"] }
+redb = "2"
+nucleo = "0.5"
+souvlaki = { version = "0.9", default-features = false, features = ["use_zbus"] }
+keyring = { version = "3", default-features = false }
+rodio = { version = "0.21", default-features = false, features = ["playback"] }
+librespot-core = { version = "0.8", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-playback = { version = "0.8", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-connect = { version = "0.8", default-features = false, features = ["rustls-tls-webpki-roots"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

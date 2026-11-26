@@ -1,7 +1,7 @@
 //! Pure-Rust Spotify Web API client, pluggable [`HttpTransport`] trait,
-//! `curl`-backed transport (zero native TLS/OpenSSL linking), mock test transport,
-//! HTTP `429 Retry-After` backoff, `ETag`/`snapshot_id` short-circuiting, and
-//! HTTP `403` graceful degradation.
+//! `reqwest`/`rustls-tls` transport, `curl`-backed transport (zero native TLS/OpenSSL linking),
+//! mock test transport, HTTP `429 Retry-After` backoff, `ETag`/`snapshot_id` short-circuiting,
+//! and HTTP `403` graceful degradation.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -11,6 +11,9 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
+use reqwest::Method as ReqwestMethod;
+use reqwest::blocking::Client as ReqwestClient;
+use reqwest::header::{CONTENT_LENGTH, HeaderName, HeaderValue};
 use vynl_core::model::{
     AlbumSummary, ArtistSummary, ConnectDevice, EpisodeSummary, ImageRef, PlaybackState,
     PlaylistSummary, RepeatMode, SearchResults, TrackSummary, UserProfile,
@@ -294,6 +297,106 @@ impl HttpTransport for CurlHttpTransport {
     }
 }
 
+/// Pure-Rust HTTP transport backed by `reqwest::blocking::Client` with `rustls-tls`
+/// and automatic `gzip` decompression (zero `openssl-sys` linking).
+#[derive(Debug, Clone)]
+pub struct ReqwestHttpTransport {
+    client: ReqwestClient,
+    timeout: Duration,
+}
+
+impl ReqwestHttpTransport {
+    /// Default per-request timeout used by [`ReqwestHttpTransport::new`].
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+
+    /// Creates a `reqwest`/`rustls-tls` HTTP transport with the default 15-second timeout.
+    ///
+    /// # Errors
+    /// Returns [`ApiError::Transport`] if the underlying `reqwest` client cannot be built.
+    pub fn new() -> Result<Self, ApiError> {
+        Self::with_timeout(Self::DEFAULT_TIMEOUT)
+    }
+
+    /// Creates a `reqwest`/`rustls-tls` HTTP transport with a custom per-request `timeout`.
+    ///
+    /// # Errors
+    /// Returns [`ApiError::Transport`] if the underlying `reqwest` client cannot be built.
+    pub fn with_timeout(timeout: Duration) -> Result<Self, ApiError> {
+        let client = ReqwestClient::builder()
+            .use_rustls_tls()
+            .timeout(timeout)
+            .build()
+            .map_err(|err| {
+                ApiError::Transport(format!("failed to initialize reqwest HTTP client: {err}"))
+            })?;
+        Ok(Self { client, timeout })
+    }
+
+    /// Returns the configured per-request timeout.
+    #[must_use]
+    pub const fn timeout(&self) -> Duration {
+        self.timeout
+    }
+}
+
+impl HttpTransport for ReqwestHttpTransport {
+    fn send(&self, request: HttpRequest) -> Result<HttpResponse, ApiError> {
+        let method = match request.method {
+            HttpMethod::Get => ReqwestMethod::GET,
+            HttpMethod::Post => ReqwestMethod::POST,
+            HttpMethod::Put => ReqwestMethod::PUT,
+            HttpMethod::Delete => ReqwestMethod::DELETE,
+        };
+
+        let needs_empty_content_length = request.body.is_none()
+            && matches!(request.method, HttpMethod::Post | HttpMethod::Put)
+            && request.header("Content-Length").is_none();
+
+        let mut builder = self.client.request(method, &request.url);
+        for (name, value) in &request.headers {
+            let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|err| {
+                ApiError::Transport(format!("invalid HTTP header name `{name}`: {err}"))
+            })?;
+            let header_value = HeaderValue::from_str(value).map_err(|err| {
+                ApiError::Transport(format!("invalid HTTP header value for `{name}`: {err}"))
+            })?;
+            builder = builder.header(header_name, header_value);
+        }
+
+        if let Some(body) = request.body {
+            builder = builder.body(body);
+        } else if needs_empty_content_length {
+            builder = builder.header(CONTENT_LENGTH, 0);
+        }
+
+        let response = builder
+            .send()
+            .map_err(|err| ApiError::Transport(format!("HTTP request failed: {err}")))?;
+
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                let text = value.to_str().map_or_else(
+                    |_| String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                    ToOwned::to_owned,
+                );
+                (name.as_str().to_owned(), text)
+            })
+            .collect();
+        let body = response.text().map_err(|err| {
+            ApiError::Transport(format!("failed reading HTTP response body: {err}"))
+        })?;
+
+        Ok(HttpResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+}
+
 /// Parses a raw HTTP response produced by `curl -i` (including intermediate `100 Continue`
 /// or proxy `200 Connection established` header blocks).
 ///
@@ -459,6 +562,17 @@ pub struct SpotifyApiClient<T: HttpTransport> {
     sleep_on_retry: bool,
 }
 
+impl SpotifyApiClient<ReqwestHttpTransport> {
+    /// Creates a new Spotify API client backed by [`ReqwestHttpTransport`] (`rustls-tls`).
+    ///
+    /// # Errors
+    /// Returns [`ApiError::Transport`] if the underlying `reqwest` client cannot be initialized.
+    pub fn new_reqwest(access_token: impl Into<String>) -> Result<Self, ApiError> {
+        let transport = ReqwestHttpTransport::new()?;
+        Ok(Self::new(transport, access_token))
+    }
+}
+
 impl<T: HttpTransport> SpotifyApiClient<T> {
     /// Creates a new Spotify API client targeting [`SPOTIFY_API_BASE_URL`].
     #[must_use]
@@ -616,6 +730,24 @@ impl<T: HttpTransport> SpotifyApiClient<T> {
     /// Returns [`ApiError`] on transport, auth, restriction, or rate-limit failures.
     pub fn play(&self) -> Result<(), ApiError> {
         self.send_api(HttpMethod::Put, "/me/player/play", &[], None)?;
+        Ok(())
+    }
+
+    /// Starts playback of specific Spotify track or episode URIs (`PUT /me/player/play`).
+    ///
+    /// # Errors
+    /// Returns [`ApiError`] on transport, auth, restriction, or rate-limit failures.
+    pub fn play_uris(&self, uris: &[&str]) -> Result<(), ApiError> {
+        let payload = JsonValue::object([(
+            "uris",
+            JsonValue::Array(uris.iter().copied().map(JsonValue::from).collect()),
+        )]);
+        let body = to_json_string(&payload);
+        let headers = [(
+            String::from("Content-Type"),
+            String::from("application/json"),
+        )];
+        self.send_api(HttpMethod::Put, "/me/player/play", &headers, Some(&body))?;
         Ok(())
     }
 
@@ -1499,6 +1631,87 @@ mod tests {
 
         client.set_access_token(refreshed.access_token);
         assert_eq!(client.me(), Err(ApiError::Unauthorized));
+        Ok(())
+    }
+
+    #[test]
+    fn play_uris_sends_put_with_json_uris_payload() -> Result<(), String> {
+        let mock = MockSpotifyTransport::new();
+        mock.push_response(HttpResponse::new(204, ""));
+
+        let client = SpotifyApiClient::new(mock, "tok-play").with_retry_sleep(false);
+        client
+            .play_uris(&["spotify:track:trk_01", "spotify:track:trk_02"])
+            .map_err(|e| e.to_string())?;
+
+        let reqs = client.transport().recorded_requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, HttpMethod::Put);
+        assert_eq!(reqs[0].url, "https://api.spotify.com/v1/me/player/play");
+        assert_eq!(reqs[0].header("Content-Type"), Some("application/json"));
+        assert_eq!(reqs[0].header("Authorization"), Some("Bearer tok-play"));
+        assert_eq!(
+            reqs[0].body.as_deref(),
+            Some(r#"{"uris":["spotify:track:trk_01","spotify:track:trk_02"]}"#)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reqwest_transport_builds_and_round_trips_local_http() -> Result<(), String> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        use super::ReqwestHttpTransport;
+
+        let default_transport = ReqwestHttpTransport::new().map_err(|e| e.to_string())?;
+        assert_eq!(default_transport.timeout(), Duration::from_secs(15));
+
+        let custom_transport = ReqwestHttpTransport::with_timeout(Duration::from_secs(5))
+            .map_err(|e| e.to_string())?;
+        assert_eq!(custom_transport.timeout(), Duration::from_secs(5));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
+        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+
+        let server = thread::spawn(move || -> Result<String, String> {
+            let (mut stream, _) = listener.accept().map_err(|e| e.to_string())?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .map_err(|e| e.to_string())?;
+            let mut buf = [0_u8; 4096];
+            let n = stream.read(&mut buf).map_err(|e| e.to_string())?;
+            let captured = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let body = r#"{"id":"u_req","display_name":"Reqwest User","product":"premium"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Test-Header: vynl\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(resp.as_bytes())
+                .map_err(|e| e.to_string())?;
+            stream.flush().map_err(|e| e.to_string())?;
+            Ok(captured)
+        });
+
+        let client = SpotifyApiClient::new_reqwest("tok-req")
+            .map_err(|e| e.to_string())?
+            .with_base_url(format!("http://127.0.0.1:{port}"))
+            .with_retry_sleep(false);
+        let profile = client.me().map_err(|e| e.to_string())?;
+        assert_eq!(profile.id, "u_req");
+        assert_eq!(profile.display_name, "Reqwest User");
+
+        let captured = server
+            .join()
+            .map_err(|_| String::from("local HTTP test server panicked"))??;
+        assert!(captured.starts_with("GET /me HTTP/1.1"));
+        assert!(
+            captured
+                .to_ascii_lowercase()
+                .contains("authorization: bearer tok-req")
+        );
         Ok(())
     }
 }

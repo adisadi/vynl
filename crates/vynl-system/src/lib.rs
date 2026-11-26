@@ -8,19 +8,26 @@ pub mod ipc;
 pub mod media;
 pub mod notify;
 pub mod paths;
+pub mod secrets;
 
 pub use ipc::{
     IpcClient, IpcCommand, IpcError, IpcResponse, IpcServer, StatusSnapshot, ipc_transport_name,
 };
 pub use media::{
     LocalMediaBridge, MediaControlBridge, MediaControlEvent, MediaMetadata, MediaPlaybackStatus,
-    media_control_backend_name,
+    SystemMediaBridge, media_control_backend_name,
 };
 pub use notify::{
     DispatchStatus, LocalOsNotifier, NotificationDispatcher, NotificationError,
     NotificationPayload, RecordingNotifier, format_notification_summary,
 };
 pub use paths::{AppPaths, EnvSnapshot};
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub use secrets::OsKeyringStore;
+pub use secrets::{
+    DEFAULT_KEYRING_SERVICE, FileSecretStore, LocalSecretStore, MemorySecretStore, SecretError,
+    SecretStore,
+};
 
 #[cfg(test)]
 mod tests {

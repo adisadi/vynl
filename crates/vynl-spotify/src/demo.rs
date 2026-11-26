@@ -3,11 +3,12 @@
 
 use std::collections::BTreeMap;
 
-use vynl_core::fuzzy::rank_items;
 use vynl_core::model::{
     AlbumSummary, ArtistSummary, ConnectDevice, EpisodeSummary, ImageRef, LibraryState,
     PlaybackState, PlaylistSummary, RepeatMode, SearchResults, TrackSummary, UserProfile,
 };
+
+use crate::search::fuzzy_rank;
 
 /// Complete offline dataset with iconic albums, tracks, playlists, artists,
 /// podcast episodes, Spotify Connect devices, and instant fuzzy search.
@@ -122,7 +123,7 @@ impl DemoCatalog {
     }
 
     /// Performs instant offline fuzzy search across tracks, albums, artists,
-    /// playlists, and podcast episodes using [`vynl_core::fuzzy::rank_items`].
+    /// playlists, and podcast episodes using [`crate::search::fuzzy_rank`] (`nucleo`).
     #[must_use]
     pub fn search(&self, query: &str) -> SearchResults {
         let trimmed = query.trim();
@@ -137,35 +138,35 @@ impl DemoCatalog {
             };
         }
 
-        let tracks = rank_items(trimmed, &self.tracks, |t| {
+        let tracks = fuzzy_rank(trimmed, &self.tracks, |t| {
             format!("{} {} {}", t.title, t.artist_line(), t.album)
         })
         .into_iter()
         .map(|(idx, _)| self.tracks[idx].clone())
         .collect();
 
-        let albums = rank_items(trimmed, &self.albums, |a| {
+        let albums = fuzzy_rank(trimmed, &self.albums, |a| {
             format!("{} {} {}", a.title, a.artists.join(" "), a.release_year)
         })
         .into_iter()
         .map(|(idx, _)| self.albums[idx].clone())
         .collect();
 
-        let artists = rank_items(trimmed, &self.artists, |a| {
+        let artists = fuzzy_rank(trimmed, &self.artists, |a| {
             format!("{} {}", a.name, a.genres.join(" "))
         })
         .into_iter()
         .map(|(idx, _)| self.artists[idx].clone())
         .collect();
 
-        let playlists = rank_items(trimmed, &self.playlists, |p| {
+        let playlists = fuzzy_rank(trimmed, &self.playlists, |p| {
             format!("{} {} {}", p.name, p.description, p.owner)
         })
         .into_iter()
         .map(|(idx, _)| self.playlists[idx].clone())
         .collect();
 
-        let episodes = rank_items(trimmed, &self.episodes, |e| {
+        let episodes = fuzzy_rank(trimmed, &self.episodes, |e| {
             format!("{} {}", e.title, e.show_name)
         })
         .into_iter()

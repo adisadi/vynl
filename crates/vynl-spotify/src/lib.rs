@@ -11,6 +11,7 @@ pub mod cache;
 pub mod demo;
 pub mod json;
 pub mod pkce;
+pub mod search;
 
 use std::time::Duration;
 

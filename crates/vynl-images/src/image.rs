@@ -372,6 +372,36 @@ impl RgbImage {
         })
     }
 
+    /// Decodes an encoded image payload (`PPM` `P6`, `PNG`, `JPEG`, or `WebP`) into
+    /// an uncompressed [`RgbImage`].
+    ///
+    /// # Errors
+    /// Returns a clear English error message if decoding fails or if the decoded
+    /// image has zero width or height.
+    pub fn decode_encoded(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.is_empty() {
+            return Err(String::from("cannot decode empty image payload"));
+        }
+
+        let decoded = if bytes.starts_with(b"P6") {
+            Self::decode_ppm(bytes)?
+        } else {
+            let dynamic = image::load_from_memory(bytes)
+                .map_err(|err| format!("failed to decode encoded image: {err}"))?;
+            let rgb = dynamic.to_rgb8();
+            Self::new(rgb.width(), rgb.height(), rgb.into_raw())?
+        };
+
+        if decoded.width == 0 || decoded.height == 0 {
+            return Err(format!(
+                "decoded image has zero dimension: {}x{}",
+                decoded.width, decoded.height
+            ));
+        }
+
+        Ok(decoded)
+    }
+
     /// Encodes the image as an uncompressed 24-bit Windows BMP (`BGR24`, bottom-up)
     /// suitable for `iTerm2` OSC 1337 inline image payloads.
     #[must_use]
@@ -842,6 +872,74 @@ mod tests {
         assert!(RgbImage::decode_ppm(b"P3\n1 1\n255\n0 0 0").is_err());
         assert!(RgbImage::decode_ppm(b"P6\n2 2\n255\n\x00\x00").is_err());
         assert!(RgbImage::decode_ppm(b"P6\n1 1\n65535\n\x00\x00\x00").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn decode_encoded_decodes_png_jpeg_webp_and_ppm_and_rejects_invalid() -> Result<(), String> {
+        use std::io::Cursor;
+
+        // Build a 4x4 reference image with four crisp color quadrants.
+        let mut raw_img = image::RgbImage::new(4, 4);
+        for y in 0..4 {
+            for x in 0..4 {
+                let px = match (x < 2, y < 2) {
+                    (true, true) => image::Rgb([220, 40, 50]),
+                    (false, true) => image::Rgb([40, 200, 90]),
+                    (true, false) => image::Rgb([50, 90, 230]),
+                    (false, false) => image::Rgb([240, 210, 45]),
+                };
+                raw_img.put_pixel(x, y, px);
+            }
+        }
+        let dynamic = image::DynamicImage::ImageRgb8(raw_img);
+
+        // PNG (lossless)
+        let mut png_bytes = Vec::new();
+        dynamic
+            .write_to(&mut Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+            .map_err(|err| format!("failed to encode test PNG: {err}"))?;
+        let png_decoded = RgbImage::decode_encoded(&png_bytes)?;
+        assert_eq!(png_decoded.width, 4);
+        assert_eq!(png_decoded.height, 4);
+        assert_eq!(png_decoded.get_pixel(0, 0), Some(Rgb::new(220, 40, 50)));
+        assert_eq!(png_decoded.get_pixel(3, 0), Some(Rgb::new(40, 200, 90)));
+        assert_eq!(png_decoded.get_pixel(0, 3), Some(Rgb::new(50, 90, 230)));
+        assert_eq!(png_decoded.get_pixel(3, 3), Some(Rgb::new(240, 210, 45)));
+
+        // WebP (lossless in image 0.25)
+        let mut webp_bytes = Vec::new();
+        dynamic
+            .write_to(&mut Cursor::new(&mut webp_bytes), image::ImageFormat::WebP)
+            .map_err(|err| format!("failed to encode test WebP: {err}"))?;
+        let webp_decoded = RgbImage::decode_encoded(&webp_bytes)?;
+        assert_eq!(webp_decoded, png_decoded);
+
+        // JPEG (lossy — verify dimensions and pixel fidelity on a solid 8x8 color tile)
+        let solid = image::RgbImage::from_pixel(8, 8, image::Rgb([200, 80, 40]));
+        let mut jpeg_bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(solid)
+            .write_to(&mut Cursor::new(&mut jpeg_bytes), image::ImageFormat::Jpeg)
+            .map_err(|err| format!("failed to encode test JPEG: {err}"))?;
+        let jpeg_decoded = RgbImage::decode_encoded(&jpeg_bytes)?;
+        assert_eq!(jpeg_decoded.width, 8);
+        assert_eq!(jpeg_decoded.height, 8);
+        let center = jpeg_decoded
+            .get_pixel(4, 4)
+            .ok_or_else(|| String::from("missing JPEG center pixel"))?;
+        assert!(center.r.abs_diff(200) <= 10);
+        assert!(center.g.abs_diff(80) <= 10);
+        assert!(center.b.abs_diff(40) <= 10);
+
+        // PPM P6 delegation
+        let ppm_bytes = png_decoded.encode_ppm();
+        let ppm_decoded = RgbImage::decode_encoded(&ppm_bytes)?;
+        assert_eq!(ppm_decoded, png_decoded);
+
+        // Error cases: empty, invalid bytes, zero-dimension PPM
+        assert!(RgbImage::decode_encoded(b"").is_err());
+        assert!(RgbImage::decode_encoded(b"definitely-not-an-image").is_err());
+        assert!(RgbImage::decode_encoded(b"P6\n0 0\n255\n").is_err());
         Ok(())
     }
 }
