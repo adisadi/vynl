@@ -5,6 +5,7 @@ pub mod auth;
 pub mod buffer;
 pub mod input;
 pub mod layout;
+pub mod logging;
 pub mod render;
 pub mod spotify_worker;
 pub mod storage;
@@ -224,6 +225,7 @@ pub fn format_doctor_report() -> String {
          themes dir:        {}\n\
          metadata cache:    {}\n\
          image cache:       {}\n\
+         log file:          {}\n\
          policy:            strictly Spotify-only (no external third-party APIs)",
         env!("CARGO_PKG_VERSION"),
         env::consts::OS,
@@ -246,6 +248,7 @@ pub fn format_doctor_report() -> String {
         paths.themes_dir.display(),
         paths.metadata_cache_file().display(),
         paths.image_cache_dir.display(),
+        paths.log_file.display(),
     )
 }
 

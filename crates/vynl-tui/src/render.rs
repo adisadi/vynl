@@ -404,14 +404,12 @@ fn render_sidebar(buf: &mut Buffer, rect: Rect, state: &AppState, theme: &Theme)
     );
     y += 1;
 
-    for (i, pl) in state.library.playlists.iter().enumerate() {
+    for (i, line) in sidebar_filtered_labels(state).into_iter().enumerate() {
         if y >= inner.bottom() {
             break;
         }
         let item_idx = nav_items.len() + i;
         let selected = focused && state.sidebar_selected == item_idx;
-        let pin = if pl.pinned { "* " } else { "  " };
-        let line = format!("{pin}{} ({})", pl.name, pl.track_count);
         let style = if selected {
             CellStyle::fg_bg(theme.background, theme.accent).bold()
         } else {
@@ -419,6 +417,38 @@ fn render_sidebar(buf: &mut Buffer, rect: Rect, state: &AppState, theme: &Theme)
         };
         buf.put_str_clipped(inner.x, y, &line, inner.width, style);
         y += 1;
+    }
+}
+
+fn sidebar_filtered_labels(state: &AppState) -> Vec<String> {
+    match state.library_filter {
+        vynl_core::model::LibraryFilter::All | vynl_core::model::LibraryFilter::Playlists => state
+            .library
+            .playlists
+            .iter()
+            .map(|pl| {
+                let pin = if pl.pinned { "* " } else { "  " };
+                format!("{pin}{} ({})", pl.name, pl.track_count)
+            })
+            .collect(),
+        vynl_core::model::LibraryFilter::Albums => state
+            .library
+            .albums
+            .iter()
+            .map(|alb| format!("  {} ({})", alb.title, alb.release_year))
+            .collect(),
+        vynl_core::model::LibraryFilter::Artists => state
+            .library
+            .artists
+            .iter()
+            .map(|artist| format!("  {}", artist.name))
+            .collect(),
+        vynl_core::model::LibraryFilter::Podcasts => state
+            .library
+            .episodes
+            .iter()
+            .map(|ep| format!("  {}", ep.title))
+            .collect(),
     }
 }
 

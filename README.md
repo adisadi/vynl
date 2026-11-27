@@ -32,13 +32,27 @@
 | **Alacritty / SSH / Fallback** | TrueColor Halfblocks | Disabled (opt-in) | Works in any 24-bit terminal |
 | **tmux / Zellij** | Passthrough / Halfblocks | Auto | Enable `allow-passthrough on` in `tmux` |
 
-## Quickstart (Development)
+## Quickstart
 
 ```bash
-# Check environment & terminal capabilities
+# Try the full TUI immediately with the built-in demo catalog & cover art
+cargo run -p vynl-tui -- --demo
+
+# Authenticate with your own Spotify Developer Client ID (OAuth 2.0 PKCE)
+cargo run -p vynl-tui -- auth --client-id <YOUR_CLIENT_ID>
+
+# Launch live Spotify TUI (optional: --features visualizer for Zen FFT bars)
+cargo run -p vynl-tui
+
+# Check environment, detected terminal image protocol, paths & OAuth state
 cargo run -p vynl-tui -- doctor
 
-# Run formatting, strict clippy lints, and tests
+# Control a running instance from status bars or scripts via local IPC
+vynl status --json
+vynl play-pause
+vynl open spotify:album:<ID>
+
+# Run formatting, strict clippy lints, and tests (including insta UI snapshots)
 just check
 ```
 

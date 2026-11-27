@@ -56,19 +56,35 @@ fn main() -> ExitCode {
         }
         Ok(CliAction::LaunchTui { demo }) => {
             let paths = AppPaths::resolve();
+            let logger = vynl_tui::logging::FileLogger::new(&paths.log_file);
             let config = storage::load_config(&paths).unwrap_or_else(|err| {
+                logger.warn("config", &format!("{err} — falling back to defaults"));
                 eprintln!("warning: {err} — falling back to default config");
                 AppConfig::default()
             });
             let proto = resolve_env_protocol(config.images.protocol);
+            logger.info(
+                "startup",
+                &format!(
+                    "launching vynl {} (mode={}, protocol={}, theme={})",
+                    env!("CARGO_PKG_VERSION"),
+                    if demo { "demo" } else { "live" },
+                    proto.as_str(),
+                    config.ui.theme
+                ),
+            );
             let app = if demo {
                 VynlApp::new_demo_with_config(config, paths, proto)
             } else {
                 VynlApp::new_live(config, paths, proto)
             };
             match app.run_interactive() {
-                Ok(()) => ExitCode::SUCCESS,
+                Ok(()) => {
+                    logger.info("shutdown", "exited cleanly");
+                    ExitCode::SUCCESS
+                }
                 Err(err) => {
+                    logger.error("runtime", &format!("failed to run TUI: {err}"));
                     eprintln!("error: failed to run TUI: {err}");
                     ExitCode::FAILURE
                 }
